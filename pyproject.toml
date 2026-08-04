@@ -1,0 +1,10 @@
+[project]
+name = "malpractice-detection"
+version = "1.0.0"
+description = "Exam malpractice detection via head-pose analysis"
+requires-python = ">=3.11"
+dependencies = [
+    "flask",
+    "numpy",
+    "opencv-python-headless==4.13.0.92",
+]
