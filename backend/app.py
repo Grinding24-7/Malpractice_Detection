@@ -5,7 +5,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, Response, jsonify, send_from_directory, send_file
+from flask import Flask, Response, jsonify, request, send_from_directory, send_file
+
+from dataset_collector import initialize_dataset, log_feature_vector
+from feature_extractor import extract_pose_features
+from retention_policy import start_auto_purge_thread
 
 app = Flask(__name__)
 
@@ -25,6 +29,19 @@ YAW_LIMIT = 30
 PITCH_LIMIT = 30
 EVIDENCE_DIR = BACKEND_DIR / "evidence_vault"
 EVIDENCE_DIR.mkdir(exist_ok=True)
+
+POSE_MODEL_PATH = os.environ.get("POSE_MODEL", str(BACKEND_DIR / "yolo11n-pose.pt"))
+LABEL_NAMES = {0: "Normal", 1: "Head Turn", 2: "Leaning", 3: "Passing"}
+
+telemetry_state = {
+    "active_recording_label": -1,
+    "recorded_samples_count": 0,
+}
+ts_lock = threading.Lock()
+
+from ultralytics import YOLO
+
+pose_model = YOLO(POSE_MODEL_PATH)
 
 import urllib.request
 
@@ -149,6 +166,7 @@ def process_frames():
         yaw = pitch = roll = 0.0
         face_detected = False
         is_anomaly = False
+        features = None
         if process_this:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(
@@ -173,6 +191,24 @@ def process_frames():
                     threading.Thread(target=export_evidence, args=(export_frames,), daemon=True).start()
             else:
                 anomaly_counter = 0
+
+            pose_results = pose_model(frame, verbose=False)
+            if pose_results and pose_results[0].keypoints is not None:
+                kpts = pose_results[0].keypoints.data.cpu().numpy()
+                if kpts.shape[0] > 0:
+                    primary = kpts[0]
+                    features = extract_pose_features(primary)
+                    for lx, ly in primary[:, :2].astype(int):
+                        cv2.circle(frame, (int(lx), int(ly)), 3, (255, 0, 255), -1)
+
+            if features is not None:
+                with ts_lock:
+                    active = telemetry_state["active_recording_label"]
+                if active in (0, 1, 2, 3):
+                    log_feature_vector(features, active)
+                    with ts_lock:
+                        telemetry_state["recorded_samples_count"] += 1
+
         frame_count += 1
         elapsed = time.time() - start_time
         with tel_lock:
@@ -188,6 +224,13 @@ def process_frames():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Anomaly:{anomaly_counter}/{ANOMALY_THRESHOLD}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255) if is_anomaly else (0, 255, 0), 2)
+        with ts_lock:
+            rec_label = telemetry_state["active_recording_label"]
+            rec_count = telemetry_state["recorded_samples_count"]
+        rec_status = "OFF" if rec_label not in (0, 1, 2, 3) else LABEL_NAMES[rec_label]
+        rec_color = (0, 0, 255) if rec_label in (0, 1, 2, 3) else (128, 128, 128)
+        cv2.putText(frame, f"REC[{rec_status}] samples:{rec_count}", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
         if anomaly_counter >= ANOMALY_THRESHOLD:
             cv2.putText(frame, "*** CHEATING ALERT ***", (frame.shape[1] // 2 - 200, frame.shape[0] // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
@@ -222,7 +265,32 @@ def video_feed():
 @app.route("/api/telemetry")
 def get_telemetry():
     with tel_lock:
-        return jsonify(telemetry)
+        tel = dict(telemetry)
+    with ts_lock:
+        tel["active_recording_label"] = telemetry_state["active_recording_label"]
+        tel["recorded_samples_count"] = telemetry_state["recorded_samples_count"]
+    return jsonify(tel)
+
+
+@app.route("/api/record_label", methods=["POST"])
+def record_label():
+    data = request.get_json(silent=True) or {}
+    label = data.get("label", -1)
+    try:
+        label = int(label)
+    except (TypeError, ValueError):
+        return jsonify({"error": "label must be an integer"}), 400
+    if label not in (-1, 0, 1, 2, 3):
+        return jsonify({"error": "label must be in [-1, 0, 1, 2, 3]"}), 400
+    with ts_lock:
+        telemetry_state["active_recording_label"] = label
+        if label == -1:
+            telemetry_state["recorded_samples_count"] = 0
+    initialize_dataset()
+    print(f"[record] active_recording_label -> {label} ({LABEL_NAMES.get(label, 'Off')})", flush=True)
+    with ts_lock:
+        return jsonify({"ok": True, "active_recording_label": telemetry_state["active_recording_label"],
+                        "recorded_samples_count": telemetry_state["recorded_samples_count"]})
 
 
 @app.route("/vault/<filename>")
@@ -237,5 +305,7 @@ def list_evidence():
 
 
 if __name__ == "__main__":
+    initialize_dataset()
+    start_auto_purge_thread(EVIDENCE_DIR, retention_seconds=86400, check_interval=3600)
     threading.Thread(target=process_frames, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

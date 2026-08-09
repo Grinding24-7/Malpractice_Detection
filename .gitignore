@@ -22,6 +22,9 @@ instance/
 backend/evidence_vault/
 backend/exports/
 
+# Generated pose dataset (collected via /api/record_label)
+backend/pose_dataset.csv
+
 # Large media assets (test videos, model weights)
 *.mp4
 backend/*.mp4

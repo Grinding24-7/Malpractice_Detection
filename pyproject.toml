@@ -7,4 +7,5 @@ dependencies = [
     "flask",
     "numpy",
     "opencv-python-headless==4.13.0.92",
+    "ultralytics==8.4.108",
 ]
