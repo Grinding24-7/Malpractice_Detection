@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
-import os, subprocess, threading, time, uuid
-from collections import deque
+"""
+app.py — Week 3: Multi-Student CCTV tracking with Ultralytics ByteTrack.
+
+Architecture:
+    - generate_stream_frames() (thread):
+        1. Every raw frame (30 FPS) is appended to per-candidate RAM ring
+           buffers (indexed by ByteTrack candidate_id) for currently active
+           candidates.
+        2. Every 6th frame (5 FPS AI sub-sampling) runs YOLO11-pose in
+           ByteTrack tracking mode (persist=True), extracts per-candidate
+           normalized pose features, scores heuristics, updates that
+           candidate's anomaly counter, and triggers per-candidate evidence
+           exports at the alert threshold.
+        3. Stale candidates (unseen for > 300 frames / 10 s) are garbage
+           collected to bound memory.
+    - /api/telemetry reports per-candidate state: [{id, ear_ratio, status}].
+"""
+
+import os
+import subprocess
+import threading
+import time
+import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 
 import cv2
@@ -8,7 +30,8 @@ import numpy as np
 from flask import Flask, Response, jsonify, request, send_from_directory, send_file
 
 from dataset_collector import initialize_dataset, log_feature_vector
-from feature_extractor import extract_pose_features
+from detector import PoseDetector
+from feature_extractor import extract_normalized_pose_features, extract_pose_features
 from retention_policy import start_auto_purge_thread
 
 app = Flask(__name__)
@@ -22,11 +45,17 @@ CAM_INDEX = 0
 CAM_WIDTH = 1280
 CAM_HEIGHT = 720
 CAM_FPS = 30
-SUBSAMPLE = 6
-ANOMALY_THRESHOLD = 10
-ALERT_COOLDOWN = 10
-YAW_LIMIT = 30
-PITCH_LIMIT = 30
+SUBSAMPLE = 6  # AI sub-sampling: every 6th frame (30 / 5 FPS)
+ANOMALY_THRESHOLD = 10  # sustained anomaly frames before an alert fires
+ALERT_COOLDOWN = 10  # seconds between exports for the same candidate
+BUFFER_FRAMES = 30 * 30  # per-candidate RAM ring buffer length (30 s @ 30 FPS)
+STALE_LOOKBACK_FRAMES = 300  # candidate cleanup after > 10 s unseen
+
+# Heuristic thresholds on the scale-normalized features.
+HEAD_TURN_EAR_RATIO_MIN = 0.70  # ear_ratio below this => head turned left
+HEAD_TURN_EAR_RATIO_MAX = 1.40  # ear_ratio above this => head turned right
+PITCH_LEAN_NORM_DROP = 0.90  # norm_vertical_drop above this => leaning/bent
+
 EVIDENCE_DIR = BACKEND_DIR / "evidence_vault"
 EVIDENCE_DIR.mkdir(exist_ok=True)
 
@@ -39,80 +68,87 @@ telemetry_state = {
 }
 ts_lock = threading.Lock()
 
-from ultralytics import YOLO
+# ---------------------------------------------------------------------------
+# Per-candidate state (keyed by ByteTrack candidate_id)
+# ---------------------------------------------------------------------------
+cand_lock = threading.Lock()
+candidate_buffers = defaultdict(lambda: deque(maxlen=BUFFER_FRAMES))
+candidate_anomaly_counters = defaultdict(int)
+candidate_cheating_states = defaultdict(bool)
+candidate_last_seen = defaultdict(int)  # last raw-frame index the candidate was active
+candidate_last_alert = defaultdict(float)  # time.monotonic() of last export
+candidate_features: dict[int, dict] = {}  # id -> latest normalized features
+current_active_ids: set[int] = set()  # candidate_ids present in the latest inference
+frame_counter = 0  # monotonic raw-frame index driving stale cleanup
 
-pose_model = YOLO(POSE_MODEL_PATH)
+detector: "PoseDetector | None" = None
 
-import urllib.request
+# ---------------------------------------------------------------------------
+# COCO-17 skeleton topology for drawing
+# ---------------------------------------------------------------------------
+SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),  # face
+    (5, 6),  # shoulders
+    (5, 7), (7, 9),  # left arm
+    (6, 8), (8, 10),  # right arm
+    (5, 11), (6, 12), (11, 12),  # torso
+    (11, 13), (13, 15),  # left leg
+    (12, 14), (14, 16),  # right leg
+]
 
-HAAR_PATH = Path("/tmp/haarcascade_frontalface_default.xml")
-if not HAAR_PATH.exists():
-    url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
-    urllib.request.urlretrieve(url, str(HAAR_PATH))
-face_cascade = cv2.CascadeClassifier(str(HAAR_PATH))
-
-MODEL_POINTS = np.array([
-    (0.0, 0.0, 0.0),
-    (0.0, -15.0, -5.0),
-    (-30.0, -30.0, -10.0),
-    (30.0, -30.0, -10.0),
-    (-25.0, -50.0, -5.0),
-    (25.0, -50.0, -5.0),
-], dtype=np.float64)
-
-FOCAL = 700
-CAM_MAT = np.array([[FOCAL, 0, 640], [0, FOCAL, 360], [0, 0, 1]], dtype=np.float64)
-DIST_COEFFS = np.zeros((4, 1), dtype=np.float64)
-
-ring_buffer = deque(maxlen=900)
-buf_lock = threading.Lock()
 latest_frame = None
 frame_lock = threading.Lock()
 
-telemetry = {
-    "yaw": 0.0, "pitch": 0.0, "roll": 0.0,
-    "face_detected": False, "anomaly": False,
-    "anomaly_count": 0, "alert": False, "fps": 0.0,
-}
+telemetry = {"fps": 0.0}
 tel_lock = threading.Lock()
 
-anomaly_counter = 0
-last_alert_time = 0
+
+# ---------------------------------------------------------------------------
+# Feature heuristics
+# ---------------------------------------------------------------------------
+
+def evaluate_candidate(features: np.ndarray) -> bool:
+    """Return True when one person's normalized pose looks anomalous."""
+    ear_ratio = float(features[0])
+    norm_vertical_drop = float(features[1])
+    nose_conf = float(features[4])
+    l_ear_conf = float(features[5])
+    r_ear_conf = float(features[6])
+
+    # Skip unreliable keypoints (low-confidence / absent) to avoid false alarms.
+    if nose_conf < 0.35 or l_ear_conf < 0.2 or r_ear_conf < 0.2:
+        return False
+
+    # Head yaw proxy: nose-to-ear asymmetry deviating from 1.0 => head turn.
+    if ear_ratio < HEAD_TURN_EAR_RATIO_MIN or ear_ratio > HEAD_TURN_EAR_RATIO_MAX:
+        return True
+    # Pitch / lean proxy: eyes dropping toward the shoulder line.
+    if norm_vertical_drop > PITCH_LEAN_NORM_DROP:
+        return True
+    return False
 
 
-def estimate_landmarks(x, y, w, h):
-    return np.array([
-        (x + w // 2, int(y + h * 0.62)),
-        (x + w // 2, int(y + h * 0.45)),
-        (x + int(w * 0.3), int(y + h * 0.33)),
-        (x + int(w * 0.7), int(y + h * 0.33)),
-        (x + int(w * 0.25), int(y + h * 0.72)),
-        (x + int(w * 0.75), int(y + h * 0.72)),
-    ], dtype=np.float64)
+# ---------------------------------------------------------------------------
+# Evidence export
+# ---------------------------------------------------------------------------
+
+def encode_frame(frame: np.ndarray) -> bytes:
+    """JPEG-encode a frame so per-candidate RAM buffers stay memory-bounded."""
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 78])
+    return buf.tobytes() if ok else b""
 
 
-def compute_head_pose(landmarks):
-    _, rvec, tvec = cv2.solvePnP(
-        MODEL_POINTS, landmarks, CAM_MAT, DIST_COEFFS,
-        flags=cv2.SOLVEPNP_ITERATIVE
-    )
-    R, _ = cv2.Rodrigues(rvec)
-    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    singular = sy < 1e-6
-    if not singular:
-        x = np.arctan2(R[2, 1], R[2, 2])
-        y = np.arctan2(-R[2, 0], sy)
-        z = np.arctan2(R[1, 0], R[0, 0])
-    else:
-        x = np.arctan2(-R[1, 2], R[1, 1])
-        y = np.arctan2(-R[2, 0], sy)
-        z = 0
-    return float(np.degrees(x)), float(np.degrees(y)), float(np.degrees(z))
-
-
-def export_evidence(frames):
-    alert_id = str(uuid.uuid4())[:8]
-    out_path = EVIDENCE_DIR / f"alert_{alert_id}.mp4"
+def export_evidence_job(alert_id: str, candidate_id: int, encoded_frames: list) -> None:
+    """Write a candidate's individual RAM buffer to an mp4 clip."""
+    frames = [
+        cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
+        for b in encoded_frames
+        if b
+    ]
+    frames = [f for f in frames if f is not None]
+    if not frames:
+        return
+    out_path = EVIDENCE_DIR / f"candidate_{candidate_id}_alert_{alert_id}.mp4"
     h, w = frames[0].shape[:2]
     cmd = [
         "ffmpeg", "-y",
@@ -131,6 +167,7 @@ def export_evidence(frames):
         proc.stdin.write(frame.tobytes())
     proc.stdin.close()
     proc.wait()
+    print(f"[export] candidate {candidate_id} -> {out_path.name}", flush=True)
 
 
 def open_capture():
@@ -148,92 +185,144 @@ def open_capture():
     raise RuntimeError("[capture] ERROR: webcam AND video file both failed to open")
 
 
-def process_frames():
-    global latest_frame, anomaly_counter, last_alert_time
+# ---------------------------------------------------------------------------
+# Drawing helpers
+# ---------------------------------------------------------------------------
+
+def draw_candidate(frame: np.ndarray, kpts: np.ndarray, box: np.ndarray,
+                   candidate_id: int, anomaly: bool) -> None:
+    x1, y1, x2, y2 = (int(v) for v in box)
+    color = (0, 0, 255) if anomaly else (0, 255, 0)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    status = "ANOMALY" if anomaly else "NOMINAL"
+    tag = f"ID:{candidate_id} {status}"
+    cv2.putText(frame, tag, (x1, max(y1 - 8, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    for (a, b) in SKELETON:
+        pa = kpts[a]
+        pb = kpts[b]
+        if pa[2] > 0.3 and pb[2] > 0.3:
+            cv2.line(frame, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])),
+                     (255, 0, 255), 2)
+    for (x, y, conf) in kpts:
+        if conf > 0.3:
+            cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)
+
+
+def garbage_collect_stale_candidates() -> None:
+    """Drop buffers/counters for candidates unseen for > STALE_LOOKBACK_FRAMES."""
+    global frame_counter
+    with cand_lock:
+        stale = [
+            cid for cid, last in candidate_last_seen.items()
+            if frame_counter - last > STALE_LOOKBACK_FRAMES
+        ]
+        for cid in stale:
+            candidate_buffers.pop(cid, None)
+            candidate_anomaly_counters.pop(cid, None)
+            candidate_cheating_states.pop(cid, None)
+            candidate_last_seen.pop(cid, None)
+            candidate_last_alert.pop(cid, None)
+            candidate_features.pop(cid, None)
+        if stale:
+            print(f"[gc] removed {len(stale)} stale candidate(s)", flush=True)
+
+
+def generate_stream_frames():
+    """Multi-candidate processing loop (runs in a background thread)."""
+    global latest_frame, frame_counter, current_active_ids, detector
+    if detector is None:
+        detector = PoseDetector()
     cap = open_capture()
-    frame_idx = 0
-    start_time = time.time()
-    frame_count = 0
+    start_time = time.monotonic()
+    frames_processed = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
-        with buf_lock:
-            ring_buffer.append(frame.copy())
-        process_this = (frame_idx % SUBSAMPLE) == 0
-        frame_idx += 1
-        yaw = pitch = roll = 0.0
-        face_detected = False
-        is_anomaly = False
-        features = None
-        if process_this:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100)
-            )
-            if len(faces) > 0:
-                face_detected = True
-                fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-                landmarks = estimate_landmarks(fx, fy, fw, fh)
-                yaw, pitch, roll = compute_head_pose(landmarks)
-                cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
-                for lx, ly in landmarks.astype(int):
-                    cv2.circle(frame, (lx, ly), 3, (0, 0, 255), -1)
-                is_anomaly = abs(yaw) > YAW_LIMIT or abs(pitch) > PITCH_LIMIT
-                anomaly_counter = anomaly_counter + 1 if is_anomaly else 0
-                t_now = time.time()
-                if anomaly_counter >= ANOMALY_THRESHOLD and (t_now - last_alert_time) > ALERT_COOLDOWN:
-                    last_alert_time = t_now
-                    anomaly_counter = 0
-                    with buf_lock:
-                        export_frames = list(ring_buffer)
-                    threading.Thread(target=export_evidence, args=(export_frames,), daemon=True).start()
-            else:
-                anomaly_counter = 0
 
-            pose_results = pose_model(frame, verbose=False)
-            if pose_results and pose_results[0].keypoints is not None:
-                kpts = pose_results[0].keypoints.data.cpu().numpy()
-                if kpts.shape[0] > 0:
-                    primary = kpts[0]
-                    features = extract_pose_features(primary)
-                    for lx, ly in primary[:, :2].astype(int):
-                        cv2.circle(frame, (int(lx), int(ly)), 3, (255, 0, 255), -1)
+        frame_counter += 1
+        process_this = (frame_counter % SUBSAMPLE) == 0
 
-            if features is not None:
-                with ts_lock:
-                    active = telemetry_state["active_recording_label"]
-                if active in (0, 1, 2, 3):
-                    log_feature_vector(features, active)
+        # --- Every raw frame (30 FPS): buffet each currently-active candidate.
+        if not process_this:
+            encoded = encode_frame(frame)
+            with cand_lock:
+                active = list(current_active_ids)
+            for cid in active:
+                with cand_lock:
+                    candidate_buffers[cid].append(encoded)
+                    candidate_last_seen[cid] = frame_counter
+        else:
+            # --- AI sub-sampling (5 FPS): tracked inference per candidate.
+            result = detector.track(frame)
+            boxes = result.boxes
+            ids = result.tracker_ids
+            kpts = result.keypoints
+            with cand_lock:
+                current_active_ids = set(int(i) for i in ids.tolist())
+
+            for idx in range(len(ids)):
+                cid = int(ids[idx])
+                person_kpts = kpts[idx]
+                features = extract_normalized_pose_features(person_kpts)
+                is_anomaly = evaluate_candidate(features)
+
+                with cand_lock:
+                    # This sub-sampled raw frame also enters the candidate's buffer.
+                    candidate_buffers[cid].append(encode_frame(frame))
+                    candidate_last_seen[cid] = frame_counter
+                    candidate_cheating_states[cid] = is_anomaly
+                    candidate_anomaly_counters[cid] = (
+                        min(candidate_anomaly_counters[cid] + 1, ANOMALY_THRESHOLD * 10)
+                        if is_anomaly
+                        else 0
+                    )
+                    candidate_features[cid] = {
+                        "ear_ratio": float(features[0]),
+                        "norm_vertical_drop": float(features[1]),
+                    }
+
+                    count = candidate_anomaly_counters[cid]
+                    now = time.monotonic()
+                    if (
+                        count >= ANOMALY_THRESHOLD
+                        and (now - candidate_last_alert[cid]) > ALERT_COOLDOWN
+                    ):
+                        candidate_last_alert[cid] = now
+                        candidate_anomaly_counters[cid] = 0
+                        snapshot = list(candidate_buffers[cid])
+                        alert_id = str(uuid.uuid4())[:8]
+                        threading.Thread(
+                            target=export_evidence_job,
+                            args=(alert_id, cid, snapshot),
+                            daemon=True,
+                        ).start()
+                        print(f"[alert] candidate {cid} anomaly sustained -> exporting", flush=True)
+
+                draw_candidate(frame, person_kpts, boxes[idx], cid, is_anomaly)
+
+            # Record labelled pose samples for dataset collection, if enabled.
+            with ts_lock:
+                active_label = telemetry_state["active_recording_label"]
+            if active_label in (0, 1, 2, 3):
+                for idx in range(len(ids)):
+                    legacy = extract_pose_features(kpts[idx])
+                    log_feature_vector(legacy, active_label)
                     with ts_lock:
                         telemetry_state["recorded_samples_count"] += 1
 
-        frame_count += 1
-        elapsed = time.time() - start_time
+            garbage_collect_stale_candidates()
+
+        frames_processed += 1
+        elapsed = time.monotonic() - start_time
         with tel_lock:
-            telemetry["yaw"] = round(yaw, 1)
-            telemetry["pitch"] = round(pitch, 1)
-            telemetry["roll"] = round(roll, 1)
-            telemetry["face_detected"] = face_detected
-            telemetry["anomaly"] = is_anomaly
-            telemetry["anomaly_count"] = anomaly_counter
-            telemetry["alert"] = anomaly_counter >= ANOMALY_THRESHOLD
-            telemetry["fps"] = round(frame_count / elapsed if elapsed > 0 else 0, 1)
-        cv2.putText(frame, f"Yaw:{yaw:.1f} Pitch:{pitch:.1f} Roll:{roll:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Anomaly:{anomaly_counter}/{ANOMALY_THRESHOLD}", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255) if is_anomaly else (0, 255, 0), 2)
-        with ts_lock:
-            rec_label = telemetry_state["active_recording_label"]
-            rec_count = telemetry_state["recorded_samples_count"]
-        rec_status = "OFF" if rec_label not in (0, 1, 2, 3) else LABEL_NAMES[rec_label]
-        rec_color = (0, 0, 255) if rec_label in (0, 1, 2, 3) else (128, 128, 128)
-        cv2.putText(frame, f"REC[{rec_status}] samples:{rec_count}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, rec_color, 2)
-        if anomaly_counter >= ANOMALY_THRESHOLD:
-            cv2.putText(frame, "*** CHEATING ALERT ***", (frame.shape[1] // 2 - 200, frame.shape[0] // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            telemetry["fps"] = round(
+                frames_processed / elapsed if elapsed > 0 else 0, 1
+            )
+
         with frame_lock:
             latest_frame = frame.copy()
 
@@ -252,6 +341,10 @@ def generate_frames():
         time.sleep(0.03)
 
 
+# ---------------------------------------------------------------------------
+# REST API
+# ---------------------------------------------------------------------------
+
 @app.route("/")
 def index():
     return send_file(FRONTEND_DIR / "index.html")
@@ -264,11 +357,45 @@ def video_feed():
 
 @app.route("/api/telemetry")
 def get_telemetry():
+    with cand_lock:
+        candidates = [
+            {
+                "id": cid,
+                "ear_ratio": round(state["ear_ratio"], 4),
+                "norm_vertical_drop": round(state["norm_vertical_drop"], 4),
+                "anomaly_count": candidate_anomaly_counters.get(cid, 0),
+                "status": "ANOMALY"
+                if candidate_cheating_states.get(cid, False)
+                else "NOMINAL",
+            }
+            for cid, state in candidate_features.items()
+        ]
+        active_candidates = len(candidates)
+        anomalous = [c for c in candidates if c["status"] == "ANOMALY"]
+        # Aggregate head-pose proxies from the first (primary) candidate so the
+        # legacy dashboard fields keep updating.
+        if candidates:
+            primary = candidates[0]
+            tel_tmp_yaw = round(max(-90.0, min(90.0, (1.0 - primary["ear_ratio"]) * 90.0)), 1)
+            tel_tmp_pitch = round(
+                max(-90.0, min(90.0, (primary["norm_vertical_drop"] - 0.5) * 90.0)), 1
+            )
+        else:
+            tel_tmp_yaw = 0.0
+            tel_tmp_pitch = 0.0
     with tel_lock:
         tel = dict(telemetry)
     with ts_lock:
         tel["active_recording_label"] = telemetry_state["active_recording_label"]
         tel["recorded_samples_count"] = telemetry_state["recorded_samples_count"]
+    tel["active_candidates"] = active_candidates
+    tel["candidates"] = candidates
+    tel["yaw"] = tel_tmp_yaw
+    tel["pitch"] = tel_tmp_pitch
+    tel["face_detected"] = active_candidates > 0
+    tel["anomaly_count"] = sum(c["anomaly_count"] for c in candidates)
+    tel["anomaly"] = len(anomalous) > 0
+    tel["alert"] = len(anomalous) > 0
     return jsonify(tel)
 
 
@@ -307,5 +434,5 @@ def list_evidence():
 if __name__ == "__main__":
     initialize_dataset()
     start_auto_purge_thread(EVIDENCE_DIR, retention_seconds=86400, check_interval=3600)
-    threading.Thread(target=process_frames, daemon=True).start()
+    threading.Thread(target=generate_stream_frames, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

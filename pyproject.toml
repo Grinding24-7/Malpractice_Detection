@@ -5,7 +5,10 @@ description = "Exam malpractice detection via head-pose analysis"
 requires-python = ">=3.11"
 dependencies = [
     "flask",
+    "kagglehub>=1.0.2",
+    "lap>=0.5.12",
     "numpy",
     "opencv-python-headless==4.13.0.92",
+    "pandas>=3.0.5",
     "ultralytics==8.4.108",
 ]

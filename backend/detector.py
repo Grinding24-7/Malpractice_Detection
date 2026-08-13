@@ -1,8 +1,10 @@
 """
-detector.py — Pose estimation + baseline heuristics.
+detector.py — Pose estimation + per-candidate heuristics.
 
 Pipeline:
-    1. YOLO11n-pose runs at 5 FPS (sub-sampled from 30 FPS stream).
+    1. YOLO11n-pose runs at 5 FPS (sub-sampled from 30 FPS stream) in
+       Ultralytics ByteTrack tracking mode, so every detected person keeps a
+       stable candidate_id across frames.
     2. Keypoint heuristics flag posture anomalies (head-down, body-turn, lean).
     3. @torch.no_grad wrappers + explicit gc prevent memory leaks.
     4. Research hooks for ST-GCN, PnP head pose, and object detection.
@@ -46,6 +48,7 @@ RIGHT_ANKLE = 16
 class InferenceResult:
     keypoints: np.ndarray  # shape (N, 17, 3) — x, y, confidence
     boxes: np.ndarray      # shape (N, 4) — xyxy
+    tracker_ids: np.ndarray  # shape (N,) — ByteTrack persistent candidate_ids
     timestamps: float      # time.monotonic() of inference
     anomaly_flags: dict[str, bool] = field(default_factory=dict)
 
@@ -53,7 +56,7 @@ class InferenceResult:
 @dataclass
 class PoseDetector:
     """
-    Wraps YOLO11n-pose with sub-sampling logic and baseline heuristics.
+    Wraps YOLO11n-pose with ByteTrack tracking + baseline heuristics.
 
     Latency target: < 15 ms per inference call on CPU (WSL).
     """
@@ -82,16 +85,31 @@ class PoseDetector:
 
     @torch.no_grad()
     def _infer(self, frame: np.ndarray) -> InferenceResult:
-        """Run YOLO11n-pose inference.  Decorated with @torch.no_grad to
-        prevent autograd graph accumulation (memory leak prevention)."""
-        results = self.model(frame, verbose=False)
+        """Run YOLO11n-pose in ByteTrack tracking mode.  Decorated with
+        @torch.no_grad to prevent autograd graph accumulation (memory leak
+        prevention).  `persist=True` keeps candidate_ids stable across frames."""
+        results = self.model.track(
+            frame, persist=True, tracker="bytetrack.yaml", verbose=False
+        )
         r = results[0]
 
-        boxes = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
-        kpts = r.keypoints.data.cpu().numpy() if r.keypoints is not None else np.empty((0, 17, 3))
+        if r.boxes is not None and r.boxes.id is not None:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            tracker_ids = r.boxes.id.cpu().numpy().astype(np.int64)
+        else:
+            boxes = np.empty((0, 4))
+            tracker_ids = np.empty((0,), dtype=np.int64)
+        kpts = (
+            r.keypoints.data.cpu().numpy()
+            if r.keypoints is not None
+            else np.empty((0, 17, 3))
+        )
 
         return InferenceResult(
-            keypoints=kpts, boxes=boxes, timestamps=time.monotonic()
+            keypoints=kpts,
+            boxes=boxes,
+            tracker_ids=tracker_ids,
+            timestamps=time.monotonic(),
         )
 
     def should_process(self) -> bool:
@@ -99,9 +117,20 @@ class PoseDetector:
         self._frame_counter += 1
         return (self._frame_counter % self.subsample_rate) == 0
 
+    def track(self, frame: np.ndarray) -> InferenceResult:
+        """
+        Run tracked inference + heuristics on a single frame.
+
+        Unlike `process()`, this always runs (no sub-sampling) so the caller
+        (e.g. app.py) controls its own sampling cadence.
+        """
+        result = self._infer(frame)
+        result.anomaly_flags = self._run_heuristics(result)
+        return result
+
     def process(self, frame: np.ndarray) -> Optional[InferenceResult]:
         """
-        Run pose inference + heuristics on a single frame.
+        Run tracked inference + heuristics on a single frame.
 
         Called by the detector thread (non-blocking w.r.t. the video reader).
         Returns None if the frame is skipped (sub-sampling).

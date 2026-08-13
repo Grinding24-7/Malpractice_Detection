@@ -22,8 +22,12 @@ instance/
 backend/evidence_vault/
 backend/exports/
 
-# Generated pose dataset (collected via /api/record_label)
+# Generated pose datasets (collected via /api/record_label or build_cctv_dataset.py)
 backend/pose_dataset.csv
+backend/pose_dataset_cctv.csv
+
+# Downloaded public datasets
+datasets/
 
 # Large media assets (test videos, model weights)
 *.mp4
