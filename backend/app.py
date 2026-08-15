@@ -33,6 +33,13 @@ from dataset_collector import initialize_dataset, log_feature_vector
 from detector import PoseDetector
 from feature_extractor import extract_normalized_pose_features, extract_pose_features
 from retention_policy import start_auto_purge_thread
+from temporal_features import (
+    HeuristicBaseline,
+    PoseWindowManager,
+    SequenceDatasetWriter,
+    TemporalFeatureExtractor,
+    normalize_keypoints,
+)
 
 app = Flask(__name__)
 
@@ -50,6 +57,11 @@ ANOMALY_THRESHOLD = 10  # sustained anomaly frames before an alert fires
 ALERT_COOLDOWN = 10  # seconds between exports for the same candidate
 BUFFER_FRAMES = 30 * 30  # per-candidate RAM ring buffer length (30 s @ 30 FPS)
 STALE_LOOKBACK_FRAMES = 300  # candidate cleanup after > 10 s unseen
+
+# Week 4: temporal pose-window configuration.
+SEQUENCE_LEN = 30  # T pose frames per candidate (~6 s of history at 5 FPS)
+TEMPORAL_RECORDING_CHUNK = 32  # labelled sequences buffered before a .pt flush
+SEQUENCE_DATASET_PATH = BACKEND_DIR / "sequence_dataset"
 
 # Heuristic thresholds on the scale-normalized features.
 HEAD_TURN_EAR_RATIO_MIN = 0.70  # ear_ratio below this => head turned left
@@ -80,6 +92,16 @@ candidate_last_alert = defaultdict(float)  # time.monotonic() of last export
 candidate_features: dict[int, dict] = {}  # id -> latest normalized features
 current_active_ids: set[int] = set()  # candidate_ids present in the latest inference
 frame_counter = 0  # monotonic raw-frame index driving stale cleanup
+
+# Week 4: per-candidate sliding pose windows + temporal feature extraction.
+pose_windows = PoseWindowManager(window_size=SEQUENCE_LEN)
+temporal_extractor = TemporalFeatureExtractor(window_size=SEQUENCE_LEN)
+temporal_baseline = HeuristicBaseline()
+sequence_writer = SequenceDatasetWriter(
+    SEQUENCE_DATASET_PATH,
+    extractor=temporal_extractor,
+    max_pending=TEMPORAL_RECORDING_CHUNK,
+)
 
 detector: "PoseDetector | None" = None
 
@@ -224,6 +246,7 @@ def garbage_collect_stale_candidates() -> None:
             candidate_last_seen.pop(cid, None)
             candidate_last_alert.pop(cid, None)
             candidate_features.pop(cid, None)
+            pose_windows.drop(cid)
         if stale:
             print(f"[gc] removed {len(stale)} stale candidate(s)", flush=True)
 
@@ -269,6 +292,24 @@ def generate_stream_frames():
                 person_kpts = kpts[idx]
                 features = extract_normalized_pose_features(person_kpts)
                 is_anomaly = evaluate_candidate(features)
+
+                # --- Week 4: temporal pose window + heuristic baseline. ---
+                # normalize_keypoints is O(17), pushing to the deque is O(1),
+                # and evaluating a (30, 17, 2) window is well under 1 ms, so
+                # the 5 FPS inference path is never blocked (reader thread is
+                # untouched — it only ever appends raw frames to its buffer).
+                xy = normalize_keypoints(person_kpts, frame.shape[1], frame.shape[0])
+                if xy is not None:
+                    pose_windows.push(cid, xy)
+                    if pose_windows.is_ready(cid):
+                        seq = pose_windows.window(cid)
+                        temporal_flags = temporal_baseline.evaluate(seq)
+                        if temporal_flags["anomalous"]:
+                            is_anomaly = True
+                        with ts_lock:
+                            active_label = telemetry_state["active_recording_label"]
+                        if active_label in (0, 1, 2, 3):
+                            sequence_writer.add(seq, active_label)
 
                 with cand_lock:
                     # This sub-sampled raw frame also enters the candidate's buffer.
@@ -396,6 +437,7 @@ def get_telemetry():
     tel["anomaly_count"] = sum(c["anomaly_count"] for c in candidates)
     tel["anomaly"] = len(anomalous) > 0
     tel["alert"] = len(anomalous) > 0
+    tel["temporal_windows_ready"] = pose_windows.ready_count()
     return jsonify(tel)
 
 
