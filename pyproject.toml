@@ -11,4 +11,9 @@ dependencies = [
     "opencv-python-headless==4.13.0.92",
     "pandas>=3.0.5",
     "ultralytics==8.4.108",
+    # Week 6: FastAPI streaming layer
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "websockets>=14.0",
 ]

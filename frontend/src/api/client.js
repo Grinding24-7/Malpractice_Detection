@@ -1,24 +1,36 @@
 // ---------------------------------------------------------------------------
 // API client — single source of truth for backend connectivity.
 //
-// Endpoint contract (spec)   -> Flask backend route
-// --------------------------   ------------------------------------------------
-//   GET  /stream (MJPEG)     -> /video_feed            (backend-annotated CCTV)
-//   POST /stream (frame)     -> /stream                (webcam inference, JSON)
-//   GET  /evidence           -> /api/evidence          (evidence clip metadata)
-//   GET  /vault/<clip>       -> /vault/<filename>      (mp4 clip download)
-//   GET  /classrooms         -> /api/classrooms        (registered classrooms)
-//   POST /classrooms         -> /api/classrooms        (register a classroom)
-//   GET  /telemetry          -> /api/telemetry         (live candidate state)
-//   GET  /dataset/<file>     -> /dataset/<file>        (training videos)
-//   POST /upload-test-video -> /upload-test-video      (offline analysis job)
-//   GET  /upload-job/<id>   -> /api/upload-job/<id>    (job progress/result)
+// Week 6 FastAPI endpoints (new):
+//   WS   /api/v1/stream/ws       — WebSocket telemetry + compressed frames
+//   GET  /api/v1/stream/mjpeg    — MJPEG stream with ByteTrack overlays
+//   POST /api/v1/upload-test-video — Multipart upload → background job
+//   GET  /api/v1/job-status/<id>  — Pollable progress endpoint
+//   POST /api/v1/webcam/toggle    — Webcam ingestion ON/OFF
+//
+// Legacy Flask endpoints (still available):
+//   GET  /video_feed              — MJPEG CCTV stream
+//   POST /stream                  — Webcam inference (per-frame)
+//   GET  /api/telemetry           — Live candidate state
+//   GET  /api/monitor/annotations — Monitoring data contract
+//   GET  /api/evidence            — Evidence vault metadata
+//   GET  /api/classrooms          — Classroom registry
 //
 // Every call has a graceful offline fallback so the UI remains usable (with a
-// "DEMO" tag) when the Flask backend is not running.
+// "DEMO" tag) when the backend is not running.
 // ---------------------------------------------------------------------------
 
 export const API_BASE = '' // same-origin in prod; Vite proxy in dev
+
+// Week 6: WebSocket base URL (FastAPI on port 8000 in dev, same-origin in prod)
+export const WS_BASE = (() => {
+  if (typeof window === 'undefined') return ''
+  const host = window.location.hostname
+  // In dev mode (Vite on 5173), connect directly to FastAPI on 8000
+  if (window.location.port === '5173') return `ws://${host}:8000`
+  // In production, same-origin WebSocket (wss:// if HTTPS)
+  return window.location.protocol === 'https:' ? `wss://${host}` : `ws://${host}`
+})()
 
 async function request(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -100,3 +112,41 @@ export const uploadTestVideo = async (file) => {
 
 /** Poll the status of an analysis job — {status, progress, result, error}. */
 export const getUploadJob = (jobId) => request(`/api/upload-job/${jobId}`)
+
+// ---------------------------------------------------------------------------
+// Week 6: FastAPI streaming endpoints
+// ---------------------------------------------------------------------------
+
+/** WebSocket URL for the real-time streaming endpoint. */
+export const streamWsUrl = () => `${WS_BASE}/api/v1/stream/ws`
+
+/** MJPEG stream URL (FastAPI backend, processed frames). */
+export const streamMjpegUrl = () => `${API_BASE}/api/v1/stream/mjpeg`
+
+/**
+ * Upload a test recording via the FastAPI backend (POST /api/v1/upload-test-video).
+ * Returns {job_id, status}.
+ */
+export const uploadTestVideoV1 = async (file) => {
+  const form = new FormData()
+  form.append('video', file)
+  const res = await fetch(`${API_BASE}/api/v1/upload-test-video`, { method: 'POST', body: form })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.detail || body.error || `upload failed: ${res.status}`)
+  }
+  return res.json()
+}
+
+/** Poll the status of a FastAPI analysis job — {status, progress, result, error}. */
+export const getJobStatusV1 = (jobId) => request(`/api/v1/job-status/${jobId}`)
+
+/** Toggle webcam ingestion on/off (POST /api/v1/webcam/toggle). */
+export const toggleWebcam = (active, sourceIndex = 0) =>
+  request('/api/v1/webcam/toggle', {
+    method: 'POST',
+    body: JSON.stringify({ active, source_index: sourceIndex }),
+  })
+
+/** Health check for the FastAPI streaming backend. */
+export const healthCheck = () => request('/api/v1/health')
