@@ -16,4 +16,6 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "python-multipart>=0.0.12",
     "websockets>=14.0",
+    # Week 7: Evidence vault & memory optimization
+    "psutil>=6.0.0",
 ]

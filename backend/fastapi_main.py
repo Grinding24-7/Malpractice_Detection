@@ -1,10 +1,13 @@
 """
-fastapi_main.py — FastAPI application entry point for Week 6 dashboard.
+fastapi_main.py — FastAPI application entry point (Week 6-7).
 
 Sets up:
     - CORS middleware (allows Vite dev server + production same-origin)
     - WebSocket + REST router mounting from api/ package
-    - Startup/shutdown lifecycle for the StreamingEngine producer thread
+    - Startup/shutdown lifecycle:
+        * StreamingEngine producer thread (Week 6)
+        * EvidenceArchiver vault initialization (Week 7)
+        * StoragePurgeDaemon background cleanup (Week 7)
     - Static file serving for the React SPA (production build)
 
 Run:
@@ -26,7 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from api.stream import router as stream_router
 from api.endpoints import router as endpoints_router
+from api.evidence import router as evidence_router
 from streaming_backend import get_streaming_engine
+from evidence_archiver import get_evidence_archiver
+from storage_purge import get_purge_daemon
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -34,14 +40,27 @@ BACKEND_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle for the async streaming engine."""
+    """Startup/shutdown lifecycle for streaming engine + evidence subsystem."""
+    # Week 6: streaming engine
     engine = get_streaming_engine()
     loop = asyncio.get_event_loop()
     engine.start(loop)
     print("[fastapi] streaming engine started", flush=True)
+
+    # Week 7: evidence vault + purge daemon
+    archiver = get_evidence_archiver()
+    archiver.start()
+    purge = get_purge_daemon()
+    purge.start()
+    print("[fastapi] evidence archiver + purge daemon started", flush=True)
+
     yield
+
+    # Shutdown
+    purge.stop()
+    archiver.stop()
     engine.stop()
-    print("[fastapi] streaming engine stopped", flush=True)
+    print("[fastapi] all subsystems stopped", flush=True)
 
 
 app = FastAPI(
@@ -72,6 +91,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 app.include_router(stream_router)
 app.include_router(endpoints_router)
+app.include_router(evidence_router)
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +99,17 @@ app.include_router(endpoints_router)
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0", "streaming": True}
+    from buffer_manager import get_buffer_manager
+    bm = get_buffer_manager()
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "streaming": True,
+        "evidence_vault": True,
+        "active_tracks": len(bm.active_ids()),
+        "buffer_frames": bm.total_frames(),
+        "buffer_memory_mb": round(bm.estimated_memory_mb(), 2),
+    }
 
 
 # ---------------------------------------------------------------------------
