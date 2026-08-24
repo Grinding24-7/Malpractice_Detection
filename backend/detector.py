@@ -48,6 +48,7 @@ RIGHT_ANKLE = 16
 class InferenceResult:
     keypoints: np.ndarray  # shape (N, 17, 3) — x, y, confidence
     boxes: np.ndarray      # shape (N, 4) — xyxy
+    confidences: np.ndarray  # shape (N,) — detection confidence per person
     tracker_ids: np.ndarray  # shape (N,) — ByteTrack persistent candidate_ids
     timestamps: float      # time.monotonic() of inference
     anomaly_flags: dict[str, bool] = field(default_factory=dict)
@@ -99,6 +100,11 @@ class PoseDetector:
         else:
             boxes = np.empty((0, 4))
             tracker_ids = np.empty((0,), dtype=np.int64)
+        confidences = (
+            r.boxes.conf.cpu().numpy()
+            if r.boxes is not None and r.boxes.conf is not None
+            else np.empty((0,))
+        )
         kpts = (
             r.keypoints.data.cpu().numpy()
             if r.keypoints is not None
@@ -108,6 +114,7 @@ class PoseDetector:
         return InferenceResult(
             keypoints=kpts,
             boxes=boxes,
+            confidences=confidences,
             tracker_ids=tracker_ids,
             timestamps=time.monotonic(),
         )

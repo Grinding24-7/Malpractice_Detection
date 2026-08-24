@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Proctoring Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+<div class="container mx-auto p-4">
+  <h1 class="text-3xl font-bold mb-4 text-center">Proctoring Dashboard</h1>
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="bg-gray-800 rounded-lg p-2">
+      <h2 class="text-xl font-semibold mb-2">Live Stream</h2>
+      <img id="liveStream" src="/video_feed" class="w-full rounded border border-gray-600" alt="Live feed">
+    </div>
+    <div class="bg-gray-800 rounded-lg p-2">
+      <h2 class="text-xl font-semibold mb-2">Head Pose (Yaw / Pitch)</h2>
+      <canvas id="poseChart" height="250"></canvas>
+      <div class="flex justify-around mt-2 text-sm" id="liveStats">
+        <span>Yaw: <span id="yawVal" class="text-green-400 font-mono">0.0</span>&deg;</span>
+        <span>Pitch: <span id="pitchVal" class="text-blue-400 font-mono">0.0</span>&deg;</span>
+        <span>Face: <span id="faceVal" class="text-yellow-400 font-mono">No</span></span>
+        <span>Anomaly: <span id="anomalyVal" class="text-red-400 font-mono">0</span></span>
+      </div>
+    </div>
+  </div>
+  <div class="mt-4 bg-gray-800 rounded-lg p-2">
+    <h2 class="text-xl font-semibold mb-2">Evidence Vault</h2>
+    <ul id="evidenceList" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2"></ul>
+  </div>
+</div>
+<script>
+const MAX_POINTS = 100;
+const yawData = [], pitchData = [], labels = [];
+const ctx = document.getElementById('poseChart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Yaw', data: yawData, borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)', tension: 0.3, fill: true },
+      { label: 'Pitch', data: pitchData, borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.1)', tension: 0.3, fill: true }
+    ]
+  },
+  options: {
+    animation: { duration: 200 },
+    responsive: true,
+    scales: {
+      x: { display: false },
+      y: { min: -90, max: 90, ticks: { stepSize: 30, color: '#ccc' }, grid: { color: '#444' } }
+    },
+    plugins: { legend: { labels: { color: '#ccc' } } }
+  }
+});
+function updateTelemetry() {
+  fetch('/api/telemetry').then(r => r.json()).then(d => {
+    document.getElementById('yawVal').textContent = d.yaw.toFixed(1);
+    document.getElementById('pitchVal').textContent = d.pitch.toFixed(1);
+    document.getElementById('faceVal').textContent = d.face_detected ? 'Yes' : 'No';
+    document.getElementById('anomalyVal').textContent = d.anomaly_count;
+    const t = new Date().toLocaleTimeString();
+    labels.push(t); yawData.push(d.yaw); pitchData.push(d.pitch);
+    if (labels.length > MAX_POINTS) { labels.shift(); yawData.shift(); pitchData.shift(); }
+    chart.update();
+  }).catch(() => {});
+}
+function updateEvidence() {
+  fetch('/api/evidence').then(r => r.json()).then(files => {
+    const el = document.getElementById('evidenceList');
+    const list = files.map(f => (typeof f === 'object' && f !== null ? f.name : f));
+    el.innerHTML = list.map(f =>
+      `<li class="bg-gray-700 rounded p-2 text-sm truncate">
+        <a href="/vault/${f}" class="text-blue-400 hover:underline" target="_blank">${f}</a>
+       </li>`
+    ).join('');
+  }).catch(() => {});
+}
+setInterval(updateTelemetry, 300);
+setInterval(updateEvidence, 2000);
+updateTelemetry();
+updateEvidence();
+</script>
+</body>
+</html>
