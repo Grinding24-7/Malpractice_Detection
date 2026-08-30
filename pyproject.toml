@@ -18,4 +18,5 @@ dependencies = [
     "websockets>=14.0",
     # Week 7: Evidence vault & memory optimization
     "psutil>=6.0.0",
+    # Week 8: Hardened streaming pipeline (zero-dep Prometheus text format)
 ]

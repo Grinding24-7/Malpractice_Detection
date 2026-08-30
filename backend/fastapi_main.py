@@ -1,13 +1,14 @@
 """
-fastapi_main.py — FastAPI application entry point (Week 6-7).
+fastapi_main.py — FastAPI application entry point (Week 6-8).
 
 Sets up:
     - CORS middleware (allows Vite dev server + production same-origin)
     - WebSocket + REST router mounting from api/ package
     - Startup/shutdown lifecycle:
-        * StreamingEngine producer thread (Week 6)
+        * StreamPipeline 3-stage async pipeline (Week 8)
         * EvidenceArchiver vault initialization (Week 7)
         * StoragePurgeDaemon background cleanup (Week 7)
+    - Prometheus metrics endpoint (GET /metrics)
     - Static file serving for the React SPA (production build)
 
 Run:
@@ -16,11 +17,10 @@ Run:
 
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -28,11 +28,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from api.stream import router as stream_router
+from api.ws_router import router as ws_v2_router
 from api.endpoints import router as endpoints_router
 from api.evidence import router as evidence_router
-from streaming_backend import get_streaming_engine
+from stream_pipeline import get_stream_pipeline
 from evidence_archiver import get_evidence_archiver
 from storage_purge import get_purge_daemon
+from metrics import get_metrics
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -40,12 +42,11 @@ BACKEND_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle for streaming engine + evidence subsystem."""
-    # Week 6: streaming engine
-    engine = get_streaming_engine()
-    loop = asyncio.get_event_loop()
-    engine.start(loop)
-    print("[fastapi] streaming engine started", flush=True)
+    """Startup/shutdown lifecycle for streaming pipeline + evidence subsystem."""
+    # Week 8: 3-stage async streaming pipeline
+    pipeline = get_stream_pipeline()
+    await pipeline.start()
+    print("[fastapi] stream pipeline started (3-stage)", flush=True)
 
     # Week 7: evidence vault + purge daemon
     archiver = get_evidence_archiver()
@@ -59,14 +60,14 @@ async def lifespan(app: FastAPI):
     # Shutdown
     purge.stop()
     archiver.stop()
-    engine.stop()
+    await pipeline.stop()
     print("[fastapi] all subsystems stopped", flush=True)
 
 
 app = FastAPI(
     title="Malpractice Detection API",
-    version="1.0.0",
-    description="Week 6 — Real-time streaming dashboard API for intelligent exam malpractice detection.",
+    version="3.0.0",
+    description="Week 8 — Hardened 3-stage async streaming pipeline for intelligent exam malpractice detection.",
     lifespan=lifespan,
 )
 
@@ -90,6 +91,7 @@ app.add_middleware(
 # Mount routers
 # ---------------------------------------------------------------------------
 app.include_router(stream_router)
+app.include_router(ws_v2_router)
 app.include_router(endpoints_router)
 app.include_router(evidence_router)
 
@@ -103,13 +105,34 @@ async def health():
     bm = get_buffer_manager()
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "streaming": True,
+        "pipeline": "3-stage-async",
         "evidence_vault": True,
         "active_tracks": len(bm.active_ids()),
         "buffer_frames": bm.total_frames(),
         "buffer_memory_mb": round(bm.estimated_memory_mb(), 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text-format metrics endpoint."""
+    m = get_metrics()
+    return Response(
+        content=m.render_prometheus(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
+@app.get("/api/v1/metrics")
+async def metrics_json():
+    """JSON metrics snapshot for dashboards."""
+    m = get_metrics()
+    return m.snapshot()
 
 
 # ---------------------------------------------------------------------------
