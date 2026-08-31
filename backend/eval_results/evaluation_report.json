@@ -1,0 +1,182 @@
+{
+  "models": [
+    {
+      "name": "XGBoost",
+      "accuracy": 1.0,
+      "macro_f1": 1.0,
+      "per_class": [
+        {
+          "class": "Normal",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Head Turning",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Note Passing",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        },
+        {
+          "class": "Peeking",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        }
+      ],
+      "fpr_per_class": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "train_time_s": 0.755,
+      "predict_time_s": 0.0011
+    },
+    {
+      "name": "Random Forest",
+      "accuracy": 1.0,
+      "macro_f1": 1.0,
+      "per_class": [
+        {
+          "class": "Normal",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Head Turning",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Note Passing",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        },
+        {
+          "class": "Peeking",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        }
+      ],
+      "fpr_per_class": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "train_time_s": 0.504,
+      "predict_time_s": 0.0494
+    },
+    {
+      "name": "LSTM (Uni)",
+      "accuracy": 1.0,
+      "macro_f1": 1.0,
+      "per_class": [
+        {
+          "class": "Normal",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Head Turning",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Note Passing",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        },
+        {
+          "class": "Peeking",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        }
+      ],
+      "fpr_per_class": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "train_time_s": 2.1,
+      "predict_time_s": 0.0037
+    },
+    {
+      "name": "Bi-LSTM+Attn",
+      "accuracy": 0.76,
+      "macro_f1": 0.6710526315789473,
+      "per_class": [
+        {
+          "class": "Normal",
+          "precision": 0.52,
+          "recall": 1.0,
+          "f1": 0.6842105263157895,
+          "support": 13
+        },
+        {
+          "class": "Head Turning",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 13
+        },
+        {
+          "class": "Note Passing",
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "support": 12
+        },
+        {
+          "class": "Peeking",
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 12
+        }
+      ],
+      "fpr_per_class": [
+        0.32432432432432434,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "train_time_s": 2.491,
+      "predict_time_s": 0.0063
+    }
+  ],
+  "class_names": [
+    "Normal",
+    "Head Turning",
+    "Note Passing",
+    "Peeking"
+  ]
+}
