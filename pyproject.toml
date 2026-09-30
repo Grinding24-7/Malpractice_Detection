@@ -5,11 +5,26 @@ description = "Exam malpractice detection via head-pose analysis"
 requires-python = ">=3.11"
 dependencies = [
     "flask>=3.0",
+    "kagglehub>=1.0.2",
+    "lap>=0.5.12",
     "numpy",
-    "opencv-python>=4.8",
-    "ultralytics>=8.4",
+    "opencv-python-headless==4.13.0.92",
+    "pandas>=3.0.5",
+    "ultralytics==8.4.108",
+    # Week 6: FastAPI streaming layer
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "websockets>=14.0",
+    # Week 7: Evidence vault & memory optimization
+    "psutil>=6.0.0",
+    # Week 8: Hardened streaming pipeline (zero-dep Prometheus text format)
+    "matplotlib>=3.11.1",
+    "seaborn>=0.13.2",
+    "xgboost>=3.2.0",
+    "scikit-learn>=1.9.0",
+    # Desktop app + pose classifier training
     "torch>=2.0",
     "mediapipe>=1.0",
     "PyQt6>=6.5",
-    "scikit-learn>=1.3",
 ]

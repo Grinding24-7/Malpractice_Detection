@@ -1,20 +1,51 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
 *.pkl
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
-# Env / logs
-.env
+# Flask / runtime
+instance/
 *.log
 
-# Runtime outputs
-backend/exports/
+# Detection runtime data - evidence clips and exports
 backend/evidence_vault/
+backend/exports/
 
-# Large binaries (weights auto-download via ultralytics/MediaPipe)
+# Generated pose datasets (collected via /api/record_label or build_cctv_dataset.py)
+backend/pose_dataset.csv
+backend/pose_dataset_cctv.csv
+
+# Downloaded public datasets
+datasets/
+
+# Large media assets (test videos, model weights)
+*.mp4
+backend/*.mp4
 *.pt
 *.task
-*.mp4
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Environment secrets
+.env
+.env.*
+
+# Test fixture videos — must come after *.mp4 so the negation wins
 !tools/_fixtures/*.mp4

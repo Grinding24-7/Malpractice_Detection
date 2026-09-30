@@ -1,8 +1,10 @@
 """
-detector.py — Pose estimation + heuristics + research module integration.
+detector.py — Pose estimation + per-candidate heuristics + research modules.
 
 Pipeline:
-    1. YOLO11n-pose runs at 5 FPS (sub-sampled from 30 FPS stream).
+    1. YOLO11n-pose runs at 5 FPS (sub-sampled from 30 FPS stream) in
+       Ultralytics ByteTrack tracking mode, so every detected person keeps a
+       stable candidate_id across frames.
     2. Keypoint heuristics flag posture anomalies (head-down, body-turn, lean).
     3. PnP 3D head pose estimation for gaze direction (via HeadPoseEstimator).
     4. ST-GCN for multi-person interaction detection.
@@ -100,6 +102,14 @@ class InferenceResult:
     keypoints: np.ndarray  # shape (N, 17, 3) — x, y, confidence
     boxes: np.ndarray      # shape (N, 4) — xyxy
     timestamps: float      # time.monotonic() of inference
+    # Defaults keep callers that do not run ByteTrack (stubbed tests, plain
+    # `model()` inference) constructible without them.
+    confidences: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.float32)
+    )
+    tracker_ids: np.ndarray = field(
+        default_factory=lambda: np.empty((0,), dtype=np.int64)
+    )
     anomaly_flags: dict[str, bool] = field(default_factory=dict)
     head_pose: dict[str, float] = field(default_factory=dict)  # yaw, pitch, roll
     interaction: str = "normal"  # ST-GCN output label
@@ -109,8 +119,8 @@ class InferenceResult:
 @dataclass
 class PoseDetector:
     """
-    Wraps YOLO11n-pose with sub-sampling, heuristics, PnP head pose,
-    ST-GCN interaction detection, and object detection.
+    Wraps YOLO11n-pose with ByteTrack tracking, sub-sampling, heuristics,
+    PnP head pose, ST-GCN interaction detection, and object detection.
 
     Latency target: < 15 ms per inference call on CPU (WSL).
     """
@@ -136,7 +146,9 @@ class PoseDetector:
         try:
             from ultralytics import YOLO
             model_path = Path(__file__).resolve().parent / "yolo11n-pose.pt"
-            self.model = YOLO(str(model_path))
+            # Prefer a checked-out copy next to this module; fall back to the
+            # bare asset name so a fresh clone still triggers the download.
+            self.model = YOLO(str(model_path if model_path.exists() else "yolo11n-pose.pt"))
             _ = self.model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
             logger.info("YOLO11n-pose loaded from %s", model_path)
         except ImportError:
@@ -186,17 +198,54 @@ class PoseDetector:
 
     @torch.no_grad()
     def _infer(self, frame: np.ndarray) -> InferenceResult:
-        """Run YOLO11n-pose inference."""
-        results = self.model(frame, verbose=False)
+        """Run YOLO11n-pose in ByteTrack tracking mode.  Decorated with
+        @torch.no_grad to prevent autograd graph accumulation (memory leak
+        prevention).  `persist=True` keeps candidate_ids stable across frames."""
+        results = self.model.track(
+            frame, persist=True, tracker="bytetrack.yaml", verbose=False
+        )
         r = results[0]
-        boxes = r.boxes.xyxy.cpu().numpy() if r.boxes is not None else np.empty((0, 4))
-        kpts = r.keypoints.data.cpu().numpy() if r.keypoints is not None else np.empty((0, 17, 3))
-        return InferenceResult(keypoints=kpts, boxes=boxes, timestamps=time.monotonic())
+
+        if r.boxes is not None and r.boxes.id is not None:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            tracker_ids = r.boxes.id.cpu().numpy().astype(np.int64)
+        else:
+            boxes = np.empty((0, 4))
+            tracker_ids = np.empty((0,), dtype=np.int64)
+        confidences = (
+            r.boxes.conf.cpu().numpy()
+            if r.boxes is not None and r.boxes.conf is not None
+            else np.empty((0,))
+        )
+        kpts = (
+            r.keypoints.data.cpu().numpy()
+            if r.keypoints is not None
+            else np.empty((0, 17, 3))
+        )
+
+        return InferenceResult(
+            keypoints=kpts,
+            boxes=boxes,
+            confidences=confidences,
+            tracker_ids=tracker_ids,
+            timestamps=time.monotonic(),
+        )
 
     def should_process(self) -> bool:
         """Sub-sample: return True only every `subsample_rate`-th call."""
         self._frame_counter += 1
         return (self._frame_counter % self.subsample_rate) == 0
+
+    def track(self, frame: np.ndarray) -> InferenceResult:
+        """
+        Run tracked inference + heuristics on a single frame.
+
+        Unlike `process()`, this always runs (no sub-sampling) so the caller
+        (e.g. app.py) controls its own sampling cadence.
+        """
+        result = self._infer(frame)
+        result.anomaly_flags = self._run_heuristics(result)
+        return result
 
     def process(self, frame: np.ndarray) -> Optional[InferenceResult]:
         """
