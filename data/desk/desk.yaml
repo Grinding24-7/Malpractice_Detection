@@ -1,0 +1,30 @@
+# Desk-object dataset. Class ids MUST match models/desk/desk_classes.py in
+# order -- a mismatch here is the most damaging silent error available,
+# because training completes normally and every id means something else at
+# inference. train_desk_objects.py verifies this map before it will train.
+#
+# Expected layout, one .txt label per image in both splits:
+#   images/train/<name>.jpg   labels/train/<name>.txt
+#   images/val/<name>.jpg     labels/val/<name>.txt
+# A label line is:  <class_id> <x_center> <y_center> <width> <height>
+# with all four coordinates normalised to 0-1.
+# An EMPTY .txt means "no desk objects in this image" -- that is a valid and
+# necessary label, not a missing annotation.
+path: ./
+train: images/train
+val: images/val
+
+names:
+  0: exam_paper
+  1: answer_sheet
+  2: notebook
+  3: pen
+  4: pencil
+  5: eraser
+  6: ruler
+  7: calculator
+  8: cell_phone
+  9: laptop
+  10: tablet
+  11: headphones
+  12: sheet_of_paper_stack

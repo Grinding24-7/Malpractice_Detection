@@ -1,0 +1,8 @@
+flask>=3.0
+numpy>=2.0
+opencv-python>=4.8
+ultralytics>=8.4
+torch>=2.0
+mediapipe>=1.0
+PyQt6>=6.5
+scikit-learn>=1.3

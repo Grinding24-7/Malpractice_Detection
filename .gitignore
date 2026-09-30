@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+.venv/
+venv/
+
+# Env / logs
+.env
+*.log
+
+# Runtime outputs
+backend/exports/
+backend/evidence_vault/
+
+# Large binaries (weights auto-download via ultralytics/MediaPipe)
+*.pt
+*.task
+*.mp4
+!tools/_fixtures/*.mp4
