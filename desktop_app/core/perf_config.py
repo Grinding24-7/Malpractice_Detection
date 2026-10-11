@@ -179,6 +179,95 @@ OBJ_ESCALATE_TO: dict[str, tuple[str, float]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Positive neutral posture filter
+# ---------------------------------------------------------------------------
+# Benign exam behaviour that shares a signature with a threat: writing looks
+# like looking down, a hand at the chin looks like phone use, a glance up
+# looks like looking away.  Each state, when active, suppresses the specific
+# threat verdict it would otherwise produce (P14 looking down, and the
+# wrist-proximity phone verdict), so a live demo of ordinary exam behaviour
+# does not light up the HUD in red.
+#
+# Angles are degrees of the 3D head pose (same sign convention as
+# HeadPoseEstimator); distances are raw pixels, tunable per deployment
+# geometry via the environment.
+
+# NEUTRAL_WRITING: head pitched down to read/write, wrist working in the
+# lower part of the candidate box with micro-oscillation (pen strokes).
+NEUTRAL_WRITING_PITCH_MIN: float = float(
+    os.environ.get("IP_NEUTRAL_WRIT_PITCH_MIN", "-35.0")
+)
+NEUTRAL_WRITING_PITCH_MAX: float = float(
+    os.environ.get("IP_NEUTRAL_WRIT_PITCH_MAX", "-15.0")
+)
+NEUTRAL_WRIST_LOWER_RATIO: float = float(
+    os.environ.get("IP_NEUTRAL_WRIST_LOWER", "0.40")
+)
+NEUTRAL_WRIST_OSC_PX: float = float(
+    os.environ.get("IP_NEUTRAL_WRIST_OSC_PX", "2.0")
+)
+NEUTRAL_WRIST_OSC_WINDOW: int = int(
+    os.environ.get("IP_NEUTRAL_WRIST_OSC_WIN", "10")
+)
+
+# NEUTRAL_THINKING: wrist resting on cheek/chin with no device near it.
+NEUTRAL_THINK_CHEEK_PX: float = float(
+    os.environ.get("IP_NEUTRAL_CHEEK_PX", "50.0")
+)
+NEUTRAL_THINK_NO_OBJ_PX: float = float(
+    os.environ.get("IP_NEUTRAL_NO_OBJ_PX", "50.0")
+)
+
+# NEUTRAL_GLANCE: brief upward pitch (checking the clock / invigilator) that
+# stops being benign once it is held for longer than this.
+NEUTRAL_GLANCE_PITCH_MIN: float = float(
+    os.environ.get("IP_NEUTRAL_GLANCE_MIN", "10.0")
+)
+NEUTRAL_GLANCE_PITCH_MAX: float = float(
+    os.environ.get("IP_NEUTRAL_GLANCE_MAX", "30.0")
+)
+NEUTRAL_GLANCE_MAX_SEC: float = float(
+    os.environ.get("IP_NEUTRAL_GLANCE_SEC", "5.0")
+)
+
+# ---------------------------------------------------------------------------
+# Desk object proximity fusion (wrist -> object)
+# ---------------------------------------------------------------------------
+# The concurrent desk-object pass answers a different question from the
+# desk-region escalation: not "does a phone exist near the student" (P38,
+# spatial-relation gated) but "is the student's wrist at this phone" --
+# raw Euclidean wrist-to-bbox-centre distance, which is what phone use
+# actually looks like from a camera.
+
+# Wrist-to-phone-bbox-centre distance under which a phone is "usable".
+PHONE_WRIST_DIST_PX: float = float(
+    os.environ.get("IP_PHONE_WRIST_PX", "120.0")
+)
+# Detection confidence the proximity verdict requires (spec: > 0.6).
+PHONE_MIN_CONF: float = float(os.environ.get("IP_PHONE_CONF", "0.6"))
+
+# Throttle for the concurrent desk-object pass.  It runs on its own thread,
+# so this bounds CPU rather than correctness -- tracks persist between passes.
+PROX_EVERY_N_FRAMES: int = int(os.environ.get("IP_PROX_EVERY_N", "3"))
+# Candidate crop expansion, as a fraction of the candidate box, so the desk
+# surface immediately in front of the student is inside the crop.
+PROX_CROP_EXPAND: float = float(os.environ.get("IP_PROX_CROP_EXPAND", "0.25"))
+# Confidence floor for the desk-object detector inside the proximity thread.
+PROX_OBJ_CONF: float = float(os.environ.get("IP_PROX_OBJ_CONF", "0.35"))
+
+# ---------------------------------------------------------------------------
+# HUD alert sustain
+# ---------------------------------------------------------------------------
+# Threat banners only turn AMBER/RED once an anomaly has held for this many
+# consecutive frames.  Below it the verdict may be published to the sidebar,
+# but the overlay does not paint a threat the temporal buffer has not yet
+# confirmed.
+ALERT_SUSTAIN_FRAMES: int = int(os.environ.get("IP_ALERT_SUSTAIN", "30"))
+# ...and RED rather than AMBER past this many, or at/above this confidence.
+ALERT_RED_FRAMES: int = int(os.environ.get("IP_ALERT_RED_FRAMES", "60"))
+ALERT_RED_CONFIDENCE: float = float(os.environ.get("IP_ALERT_RED_CONF", "0.90"))
+
+# ---------------------------------------------------------------------------
 # MediaPipe PoseLandmarker
 # ---------------------------------------------------------------------------
 
@@ -369,5 +458,9 @@ def describe() -> str:
         f"obj_model={OBJ_CUSTOM_MODEL_FILE}->{OBJ_FALLBACK_MODEL_FILE} "
         f"mp={MP_MODEL_VARIANT} target_fps={TARGET_INFERENCE_FPS} "
         f"warn_ms={WARN_THRESHOLD_MS} warmup={WARMUP_FRAMES} "
-        f"streak={ANOMALY_MIN_STREAK_FRAMES} margin={ANOMALY_MIN_MARGIN}"
+        f"streak={ANOMALY_MIN_STREAK_FRAMES} margin={ANOMALY_MIN_MARGIN} "
+        f"neutral=(writing {NEUTRAL_WRITING_PITCH_MIN}..{NEUTRAL_WRITING_PITCH_MAX} "
+        f"cheek@{NEUTRAL_THINK_CHEEK_PX}px glance<{NEUTRAL_GLANCE_MAX_SEC}s) "
+        f"prox=(dist<{PHONE_WRIST_DIST_PX}px conf>{PHONE_MIN_CONF} "
+        f"every={PROX_EVERY_N_FRAMES}) alert_sustain={ALERT_SUSTAIN_FRAMES}"
     )

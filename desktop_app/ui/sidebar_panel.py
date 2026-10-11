@@ -110,13 +110,29 @@ class SidebarPanel(QWidget):
 
     def update_pose(self, result: dict) -> None:
         pose_id = result.get("pose_id", "P01")
-        is_anomaly = pose_id != "P01"
-        color = "#ff6b6b" if is_anomaly else "#51cf66"
+        # System states (camera fault / startup) and neutral posture states
+        # are not anomalies; neutral states get their own green treatment so
+        # "writing" never reads as a quiet alert.
+        is_system = pose_id in ("NO_SIGNAL", "INITIALIZING")
+        neutral_label = result.get("neutral_label") or ""
+        is_neutral = bool(neutral_label) and pose_id == "P01"
+        is_anomaly = pose_id != "P01" and not is_system
+        if is_system:
+            color = "#4dabf7"
+        elif is_anomaly:
+            color = "#ff6b6b"
+        else:
+            color = "#51cf66"
         self.pose_id_label.setText(f"Pose: {pose_id}")
         self.pose_id_label.setStyleSheet(
             f"color: {color}; font-size: 20px; font-weight: bold; font-family: monospace;"
         )
-        self.pose_name_label.setText(result.get("pose_name", "--"))
+        if is_neutral:
+            # The neutral filter vouched for this frame: name the benign
+            # state instead of the generic "Normal Sitting".
+            self.pose_name_label.setText(f"{neutral_label} (Neutral)")
+        else:
+            self.pose_name_label.setText(result.get("pose_name", "--"))
         self.confidence_label.setText(f"Confidence: {result.get('confidence', 0):.0%}")
 
         # 3D Head Pose
@@ -160,16 +176,21 @@ class SidebarPanel(QWidget):
         self.inference_fps_label.setText(f"Inference FPS: {fps:.1f}")
 
     def update_anomaly_ticker(self, result: dict) -> None:
-        if result.get("pose_id", "P01") != "P01":
-            ts = datetime.now().strftime("%H:%M:%S")
-            entry = (
-                f"[{ts}] {result['pose_id']} - "
-                f"{result.get('pose_name', '?')} "
-                f"({result.get('confidence', 0):.0%})"
-            )
-            self.ticker.append(entry)
-            sb = self.ticker.verticalScrollBar()
-            sb.setValue(sb.maximum())
+        pose_id = result.get("pose_id", "P01")
+        # Neutral posture is a non-finding by construction (its verdict is
+        # published as P01), and system states are not verdicts at all --
+        # neither belongs in a ticker of anomalies.
+        if pose_id in ("P01", "NO_SIGNAL", "INITIALIZING"):
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = (
+            f"[{ts}] {pose_id} - "
+            f"{result.get('pose_name', '?')} "
+            f"({result.get('confidence', 0):.0%})"
+        )
+        self.ticker.append(entry)
+        sb = self.ticker.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
     # Helpers

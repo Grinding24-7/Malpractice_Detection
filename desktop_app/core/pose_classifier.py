@@ -121,7 +121,12 @@ POSE_MAP: dict[str, str] = {
     "P11": "Body Turn Right",
     "P12": "Looking Away",
     "P13": "Note Peeking",
-    "P14": "Talking / Whispering",
+    # Produced by HeadPoseEstimator's PITCH_LOOKING_DOWN_THRESHOLD anomaly
+    # (head_pose.py), NOT by any talking/whispering test -- the old
+    # "Talking / Whispering" label misdescribed every alert this id ever
+    # produced.  See _evaluate_rules, which returns P14 for
+    # "P14_LOOKING_DOWN" and for nothing else.
+    "P14": "Looking Down",
     "P15": "Standing Up",
     "P16": "Absent Seat",
     "P17": "Absent + Multiple",
@@ -139,6 +144,12 @@ POSE_MAP: dict[str, str] = {
     "P29": "Chin Rest",
     "P30": "Crossed Arms",
     "P31": "Extreme Side Lean",
+    # Wrist-to-phone proximity verdict from the concurrent desk-object pass
+    # (see set_proximity / _phone_proximity_hit).  Deliberately a separate id
+    # from P31 (side lean) and P38 (object merely present with spatial
+    # agreement): this one asserts use, and only fires when the wrist is at
+    # the phone.
+    "P31_PHONE_USABILITY": "Phone Usability",
     "P32": "Backward Lean",
     "P33": "Forward Hunch",
     "P34": "Eye Gaze Averted",
@@ -254,6 +265,243 @@ def _dist_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
+# ---------------------------------------------------------------------------
+# Positive neutral posture filter
+# ---------------------------------------------------------------------------
+# Ordinary exam behaviour that shares a signature with a threat: writing
+# looks like looking down, a hand at the chin looks like phone use, a glance
+# at the clock looks like looking away.  Each state, when active, suppresses
+# the specific verdicts it would otherwise produce, so a live demo of a
+# student simply taking an exam does not light the HUD up in red.
+
+NEUTRAL_WRITING = "NEUTRAL_WRITING"
+NEUTRAL_THINKING = "NEUTRAL_THINKING"
+NEUTRAL_GLANCE = "NEUTRAL_GLANCE"
+
+NEUTRAL_LABELS: dict[str, str] = {
+    NEUTRAL_WRITING: "Writing (Neutral)",
+    NEUTRAL_THINKING: "Thinking (Neutral)",
+    NEUTRAL_GLANCE: "Looking Up (Neutral)",
+}
+
+# Threat verdicts a neutral state overrides.  P14 is the Looking Down
+# verdict produced by HeadPoseEstimator's pitch test; P31_PHONE_USABILITY is
+# the wrist-proximity phone verdict.  Nothing else is suppressed -- a neutral
+# posture must never hide a second person, a stand-up, or an absent seat.
+_NEUTRAL_SUPPRESSES: frozenset[str] = frozenset({
+    "P14", "P31_PHONE_USABILITY",
+})
+
+# Object labels that make a hand-at-cheek read as device use rather than
+# thinking.  'cell_phone' and 'device' as specified; 'phone' is the COCO
+# fallback's spelling of the same class.
+_NEUTRAL_DEVICE_LABELS: frozenset[str] = frozenset({
+    "cell_phone", "device", "phone",
+})
+
+
+def _visible_xy(
+    keypoints: list[tuple[float, float, float]] | None, idx: int
+) -> tuple[float, float] | None:
+    """Landmark *idx* as (x, y) when it is visible enough to reason about."""
+    if not keypoints or len(keypoints) <= idx:
+        return None
+    x, y, vis = keypoints[idx]
+    if vis is not None and vis < 0.5:
+        return None
+    if x != x or y != y:  # NaN
+        return None
+    return (float(x), float(y))
+
+
+def check_neutral_alignment(
+    keypoints: list[tuple[float, float, float]] | None,
+    yaw: float,
+    pitch: float,
+    roll: float,
+    desk_objects: list[dict[str, Any]] | None,
+    bbox: list[int] | None = None,
+    temporal: "_TemporalBuffer | None" = None,
+) -> str | None:
+    """Classify the current frame as a benign exam state, or ``None``.
+
+    Parameters
+    ----------
+    keypoints
+        MediaPipe 33-point landmarks of the primary candidate as
+        ``(x, y, visibility)`` tuples.  Wrists, mouth and nose are the
+        landmarks the three tests read.
+    yaw, pitch, roll
+        3D head pose in degrees from ``HeadPoseEstimator``.  Only *pitch* is
+        read today; yaw and roll are part of the contract so a neutral
+        sideways-glance test can be added without changing callers.
+    desk_objects
+        detections with ``label``/``box``/``confidence`` from the concurrent
+        desk-object pass and/or the anomaly-triggered desk-region pass.
+    bbox
+        Candidate bounding box, needed for the "wrist in the lower 40%"
+        writing test.
+    temporal
+        Sliding window that carries wrist history (micro-oscillation) and
+        the glance clock.  Without it the stateful tests cannot run and
+        only the stateless parts are evaluated.
+
+    States, in priority order:
+
+    ``NEUTRAL_WRITING``
+        pitch in [-35, -15] degrees (head down onto the page), wrist inside
+        the lower 40% of the candidate box, and the wrist trace showing
+        micro-oscillation (pen strokes).
+
+    ``NEUTRAL_THINKING``
+        a visible wrist within 50 px of the cheek/chin while no device-class
+        object sits within 50 px of that wrist.
+
+    ``NEUTRAL_GLANCE``
+        pitch in [+10, +30] degrees continuously for under 5 seconds.
+    """
+    lms = keypoints or []
+    has_lms = len(lms) >= 33
+
+    # Both clocks tick every frame, in or out of any neutral band, so an
+    # early return below can never freeze the glance timer or mix pre-band
+    # wrist motion into the current oscillation window.
+    if temporal is not None:
+        temporal.note_wrist(*_wrist_or_none(lms))
+        glance_elapsed = temporal.update_glance(
+            perf_config.NEUTRAL_GLANCE_PITCH_MIN
+            <= pitch
+            <= perf_config.NEUTRAL_GLANCE_PITCH_MAX,
+            time.monotonic(),
+        )
+    else:
+        glance_elapsed = None
+
+    # ── NEUTRAL_WRITING ────────────────────────────────────────────────
+    writing_band = (
+        perf_config.NEUTRAL_WRITING_PITCH_MIN
+        <= pitch
+        <= perf_config.NEUTRAL_WRITING_PITCH_MAX
+    )
+    if writing_band and temporal is not None and bbox and len(bbox) == 4:
+        x1, y1, x2, y2 = bbox
+        band_top = y1 + (1.0 - perf_config.NEUTRAL_WRIST_LOWER_RATIO) * (y2 - y1)
+        for wrist_idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+            wrist = _visible_xy(lms, wrist_idx)
+            if wrist is None:
+                continue
+            if band_top <= wrist[1] <= y2 and temporal.wrist_micro_oscillation():
+                return NEUTRAL_WRITING
+
+    if not has_lms:
+        return None
+
+    # ── NEUTRAL_THINKING ───────────────────────────────────────────────
+    cheek = _cheek_anchor(lms)
+    if cheek is not None:
+        for wrist_idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+            wrist = _visible_xy(lms, wrist_idx)
+            if wrist is None:
+                continue
+            if _dist_2d(wrist, cheek) > perf_config.NEUTRAL_THINK_CHEEK_PX:
+                continue
+            # Hand at the cheek is only innocent when nothing the hand could
+            # be holding is anywhere near it.
+            if not any(
+                obj.get("label") in _NEUTRAL_DEVICE_LABELS
+                and _obj_within(obj.get("box"), wrist,
+                                perf_config.NEUTRAL_THINK_NO_OBJ_PX)
+                for obj in (desk_objects or [])
+            ):
+                return NEUTRAL_THINKING
+
+    # ── NEUTRAL_GLANCE ─────────────────────────────────────────────────
+    if glance_elapsed is not None and (
+        glance_elapsed < perf_config.NEUTRAL_GLANCE_MAX_SEC
+    ):
+        return NEUTRAL_GLANCE
+
+    return None
+
+
+def _wrist_or_none(
+    lms: list[tuple[float, float, float]]
+) -> tuple[float | None, float | None]:
+    """The most visible wrist, for the oscillation history."""
+    best: tuple[float, float] | None = None
+    best_vis = -1.0
+    for idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+        if len(lms) <= idx:
+            continue
+        x, y, vis = lms[idx]
+        if vis is not None and vis > best_vis and x == x and y == y:
+            best_vis = vis
+            best = (float(x), float(y))
+    if best is None or best_vis < 0.5:
+        return (None, None)
+    return best
+
+
+def _cheek_anchor(
+    lms: list[tuple[float, float, float]]
+) -> tuple[float, float] | None:
+    """Cheek/chin position: mouth midpoint, nose as a fallback.
+
+    MediaPipe's 33-point pose has no explicit cheek or chin landmark, so the
+    mouth corners are the closest measured proxy; the nose is used when the
+    mouth is occluded by the very hand we are testing for.
+    """
+    left = _visible_xy(lms, MP_MOUTH_LEFT)
+    right = _visible_xy(lms, MP_MOUTH_RIGHT)
+    if left is not None and right is not None:
+        return ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
+    return _visible_xy(lms, MP_NOSE)
+
+
+def _obj_within(
+    obj_box: Any, point: tuple[float, float], max_px: float
+) -> bool:
+    """True when *point* is within *max_px* of box *obj_box* (or inside it)."""
+    if not obj_box or len(obj_box) != 4:
+        return False
+    ox1, oy1, ox2, oy2 = (float(v) for v in obj_box)
+    px, py = point
+    dx = max(ox1 - px, 0.0, px - ox2)
+    dy = max(oy1 - py, 0.0, py - oy2)
+    return math.sqrt(dx * dx + dy * dy) <= max_px
+
+
+def _merge_detections(
+    primary: list[dict[str, Any]],
+    secondary: list[dict[str, Any]],
+    iou_floor: float = 0.30,
+) -> list[dict[str, Any]]:
+    """Union two detection lists without double-counting the same object.
+
+    The anomaly-triggered desk-region pass and the concurrent candidate-crop
+    pass can both see the same phone; reporting it twice would corrupt the
+    wrist-distance comparison (a duplicate would always be "nearest").  A
+    same-label pair overlapping above *iou_floor* is one object -- the
+    higher-confidence box wins, since it is the better localisation.
+    """
+    merged: list[dict[str, Any]] = [dict(d) for d in primary]
+    for det in secondary:
+        dup_idx = None
+        for i, existing in enumerate(merged):
+            if existing.get("label") != det.get("label"):
+                continue
+            if box_iou(existing.get("box") or [], det.get("box") or []) >= iou_floor:
+                dup_idx = i
+                break
+        if dup_idx is None:
+            merged.append(dict(det))
+        elif float(det.get("confidence", 0.0)) > float(
+            merged[dup_idx].get("confidence", 0.0)
+        ):
+            merged[dup_idx] = dict(det)
+    return merged
+
+
 class _TemporalBuffer:
     """Sliding-window motion history buffer for a single candidate track."""
 
@@ -262,6 +510,7 @@ class _TemporalBuffer:
         "_pose_streak_id", "_pose_streak_len",
         "_pitch_baseline", "_yaw_baseline",
         "_turn_baseline", "_turn_mad",
+        "_wrist_hist", "_glance_start",
     )
 
     def __init__(self) -> None:
@@ -282,6 +531,14 @@ class _TemporalBuffer:
         # _turn_deviation_z), so it gets its own baseline and dispersion.
         self._turn_baseline: float | None = None
         self._turn_mad: float | None = None
+        # Wrist positions for the neutral-writing micro-oscillation test, and
+        # the start time of a continuous in-band positive pitch for the
+        # neutral-glance test.  Both are written by the neutral posture
+        # engine each frame (see PoseClassifier.classify).
+        self._wrist_hist: collections.deque[tuple[float, float]] = collections.deque(
+            maxlen=max(2, perf_config.NEUTRAL_WRIST_OSC_WINDOW)
+        )
+        self._glance_start: float | None = None
 
     # ── Baseline tracking ──────────────────────────────────────────────
 
@@ -400,6 +657,74 @@ class _TemporalBuffer:
         """Reset the sustained anomaly streak counter."""
         self._anomaly_streak = 0
 
+    # ── Neutral posture helpers ────────────────────────────────────────
+
+    def note_wrist(self, x: float | None, y: float | None) -> None:
+        """Record this frame's wrist position for the oscillation test.
+
+        ``None`` clears the history: a wrist that leaves the frame mid-stroke
+        must not have its pre-gap motion counted as current oscillation.
+        """
+        if x is None or y is None or x != x or y != y:
+            self._wrist_hist.clear()
+            return
+        self._wrist_hist.append((x, y))
+
+    def wrist_micro_oscillation(self) -> bool:
+        """True when the recorded wrist trace shows pen-stroke-scale motion.
+
+        A writing hand alternates direction every few frames over a small
+        distance; a hand resting on the cheek barely moves, and a hand
+        reaching for a phone travels one way and stops.  Both conditions are
+        required -- enough peak-to-peak travel to be a real movement, and at
+        least two direction reversals to distinguish oscillation from a
+        single reach.
+        """
+        hist = list(self._wrist_hist)
+        if len(hist) < 4:
+            return False
+        xs = [p[0] for p in hist]
+        ys = [p[1] for p in hist]
+        travel = max(xs) - min(xs)
+        # Vertical travel counts too: small downward-tilted writing strokes
+        # are often mostly vertical in the image plane.
+        travel = max(travel, max(ys) - min(ys))
+        if travel < perf_config.NEUTRAL_WRIST_OSC_PX:
+            return False
+
+        reversals = 0
+        prev_dir = 0
+        for i in range(1, len(hist)):
+            dx = xs[i] - xs[i - 1]
+            dy = ys[i] - ys[i - 1]
+            # Project onto the axis carrying most of the motion.
+            if abs(dx) >= abs(dy):
+                step = 1 if dx > 0 else (-1 if dx < 0 else 0)
+            else:
+                step = 1 if dy > 0 else (-1 if dy < 0 else 0)
+            if step == 0:
+                continue
+            if prev_dir != 0 and step != prev_dir:
+                reversals += 1
+            prev_dir = step
+        return reversals >= 2
+
+    def update_glance(self, pitch_in_band: bool, now: float) -> float | None:
+        """Track how long a positive-pitch glance has been held (seconds).
+
+        Returns ``None`` whenever the pitch leaves the neutral-glance band,
+        and ``0.0`` on the first in-band frame, so the caller can tell "no
+        glance" from "glance just began".  Only one continuous upward look
+        is ever measured: leaving the band resets the clock.
+        """
+        if not pitch_in_band:
+            self._glance_start = None
+            return None
+        if self._glance_start is None:
+            self._glance_start = now
+            return 0.0
+        return max(0.0, now - self._glance_start)
+
     @property
     def is_sustained_anomaly(self) -> bool:
         """True if anomaly has been active for > _SUSTAINED_THRESHOLD frames."""
@@ -438,6 +763,9 @@ class PoseClassifier:
         self._last_features: dict[str, float] = {}
         self._ml_classifier: Any = None
         self._slow_frame_counter = 0
+        # Frames the current raw verdict has held (see _apply_stability_gate),
+        # published in temporal_metrics for the HUD's alert-sustain tier.
+        self._last_gate_streak: int = 0
         # Frames seen since construction.  Used to hold back the first
         # verdicts while the models and the temporal baselines settle.
         self._frames_seen = 0
@@ -451,6 +779,10 @@ class PoseClassifier:
         self._last_landmarks: list[tuple[float, float, float]] | None = None
         self._last_person_bbox: list[int] | None = None
         self._last_shoulder_width: float = 0.0
+        # Latest snapshot from the concurrent desk-proximity thread (see
+        # set_proximity).  Written only from the inference thread, between
+        # frames; never shared with the detection thread directly.
+        self._proximity: dict[str, Any] | None = None
         self._init_yolo()
         self._init_object_detector()
         self._init_mediapipe()
@@ -628,6 +960,61 @@ class PoseClassifier:
             has_landmarks=self._last_landmarks is not None,
         )
 
+    def set_proximity(self, snapshot: dict[str, Any] | None) -> None:
+        """Publish the latest desk-proximity snapshot for the next frame.
+
+        Called by InferenceWorker immediately before ``classify()`` on the
+        same thread (the concurrent detection thread writes its own snapshot
+        under a lock; the worker copies it out and hands it over here), so
+        the classifier itself is never touched from a second thread.  The
+        snapshot shape is ``{"objects": [...], "phone": {...} | None,
+        "ts": float}`` -- see DeskProximityThread.snapshot().
+        """
+        self._proximity = snapshot if isinstance(snapshot, dict) else None
+
+    def _phone_proximity_hit(
+        self, objects: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The strongest wrist-at-phone evidence in *objects*, if any.
+
+        Distance is raw Euclidean pixels between a visible wrist keypoint and
+        the detection's bbox centre (the shared ObjectContext relation uses
+        shoulder-width-normalised distances for its escalation gate; this is
+        the tighter "the hand is ON the phone" test for usability).  Both the
+        distance threshold and the confidence floor are required -- a fuzzy
+        box near a wrist, or a confident phone across the desk, is not use.
+        """
+        if not objects:
+            return None
+        wrists = []
+        for idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+            pt = _visible_xy(self._last_landmarks, idx)
+            if pt is not None:
+                wrists.append(pt)
+        if not wrists:
+            return None
+
+        best: dict[str, Any] | None = None
+        best_dist = float("inf")
+        for obj in objects:
+            if obj.get("label") not in _NEUTRAL_DEVICE_LABELS:
+                continue
+            if float(obj.get("confidence", 0.0)) <= perf_config.PHONE_MIN_CONF:
+                continue
+            box = obj.get("box")
+            if not box or len(box) != 4:
+                continue
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            dist = min(_dist_2d(w, (cx, cy)) for w in wrists)
+            if dist < best_dist:
+                best_dist = dist
+                best = dict(obj)
+                best["wrist_dist"] = round(dist, 1)
+        if best is None or best_dist >= perf_config.PHONE_WRIST_DIST_PX:
+            return None
+        return best
+
     def classify(self, frame: np.ndarray) -> dict[str, Any]:
         """Classify the frame and return a standardised result dict.
 
@@ -742,11 +1129,65 @@ class PoseClassifier:
                 pose_id, confidence, objects_detected
             )
 
+        # ── Concurrent desk-object proximity fusion ─────────────────────
+        # The DeskProximityThread runs its own desk YOLO pass on candidate
+        # crops in parallel with this loop.  Its detections are merged with
+        # any the anomaly-triggered pass above produced, so the phone rule
+        # sees one list regardless of which pass saw the phone first.
+        proximity_snapshot = self._proximity
+        phone_hit: dict[str, Any] | None = None
+        if proximity_snapshot:
+            merged_objects = _merge_detections(
+                objects_detected, proximity_snapshot.get("objects") or []
+            )
+            if merged_objects is not objects_detected:
+                objects_detected = merged_objects
+            phone_hit = self._phone_proximity_hit(objects_detected)
+            if phone_hit is None:
+                phone_hit = proximity_snapshot.get("phone")
+        if phone_hit is not None:
+            # Usability, not mere presence: the wrist must be AT the phone
+            # and the detection must be confident.  Held to the stability
+            # gate like every other anomaly below.
+            pose_id = "P31_PHONE_USABILITY"
+            confidence = max(confidence, 0.85)
+
+        # ── Positive neutral posture filter ─────────────────────────────
+        # Evaluated before the gate so a suppressed threat never accumulates
+        # a streak: while the student is demonstrably writing / thinking /
+        # glancing, the gate sees P01 and the streak resets.  When the
+        # neutral state ends, a real threat must re-earn its streak from
+        # zero rather than resuming an old one.
+        neutral_state = None
+        if not warming_up:
+            neutral_state = check_neutral_alignment(
+                self._last_landmarks,
+                head_pose["yaw"], head_pose["pitch"], head_pose["roll"],
+                objects_detected,
+                bbox=list(primary_bbox) if primary_bbox else None,
+                temporal=self._temporal_buffer,
+            )
+        if neutral_state is not None and pose_id in _NEUTRAL_SUPPRESSES:
+            temporal_metrics["neutral_suppressed"] = 1.0
+            logger.debug(
+                "neutral %s suppresses %s", neutral_state, pose_id
+            )
+            pose_id, confidence = "P01", 0.95
+
         # ── Temporal / confidence gate ───────────────────────────────────
         # Applied to the FINAL verdict, so an object-driven escalation is held
         # to the same persistence requirement as a pose-driven one.
         pose_id, confidence, suppressed = self._apply_stability_gate(
             pose_id, confidence, warming_up=warming_up
+        )
+
+        # The raw streak counts frames the rule has been firing (including
+        # ones the gate still withholds); the sustained one counts published
+        # anomaly frames.  The HUD's alert tiers key off the larger of the
+        # two so a threat reaches AMBER at frame 30 of continuous behaviour,
+        # not frame 42.  Both are published once per frame, below.
+        temporal_metrics["anomaly_streak"] = float(
+            0 if warming_up else self._last_gate_streak
         )
 
         # ── Startup warmup ───────────────────────────────────────────────
@@ -780,18 +1221,26 @@ class PoseClassifier:
         else:
             self._temporal_buffer.clear_anomaly()
 
+        # Published after record_anomaly so this frame's verdict is counted.
+        temporal_metrics["sustained_anomaly_frames"] = float(
+            self._temporal_buffer._anomaly_streak
+        )
+
         if self._temporal_buffer.is_sustained_anomaly:
             # Escalate confidence for sustained anomalies
             confidence = min(confidence + 0.10, 0.99)
-            temporal_metrics["sustained_anomaly_frames"] = float(
-                self._temporal_buffer._anomaly_streak
-            )
 
         # ── Optional ML classifier override ──────────────────────────────
         if self._ml_classifier is not None and features and not warming_up:
             ml_pose_id, ml_conf = self._ml_predict(features)
             if ml_conf > 0.80:
-                pose_id, confidence = ml_pose_id, ml_conf
+                # The neutral filter is a promise that these specific alerts
+                # stay down while benign behaviour is being demonstrated; an
+                # ML override must not be able to sneak them back in.
+                if neutral_state is not None and ml_pose_id in _NEUTRAL_SUPPRESSES:
+                    temporal_metrics["neutral_suppressed"] = 1.0
+                else:
+                    pose_id, confidence = ml_pose_id, ml_conf
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if elapsed_ms > perf_config.WARN_THRESHOLD_MS:
@@ -821,6 +1270,24 @@ class PoseClassifier:
             "anomalies": anomalies_from_head,
             "anomaly_flags": self._build_flags(pose_id),
             "objects_detected": objects_detected,
+            # Positive neutral posture filter output.  The label is resolved
+            # here so the HUD and sidebar never have to import NEUTRAL_LABELS
+            # to render a state.
+            "neutral_state": neutral_state,
+            "neutral_label": NEUTRAL_LABELS.get(neutral_state or "", ""),
+            "neutral_suppressed": bool(
+                temporal_metrics.get("neutral_suppressed")
+            ),
+            # Wrist-to-phone evidence for telemetry/debug overlays.
+            "phone_proximity": (
+                {
+                    "label": phone_hit.get("label"),
+                    "confidence": phone_hit.get("confidence"),
+                    "wrist_dist": phone_hit.get("wrist_dist"),
+                }
+                if phone_hit is not None
+                else None
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -969,15 +1436,20 @@ class PoseClassifier:
             # downgraded: a camera fault reported as "P01 Normal Sitting" is
             # exactly the false reassurance this whole mechanism exists to
             # prevent.
+            self._last_gate_streak = 0
             return pose_id, confidence, False
 
         if pose_id in perf_config.IMMEDIATE_POSES:
+            # Immediate poses never accumulate a streak (by design), so the
+            # published one must not carry over from the pose before it.
+            self._last_gate_streak = 0
             return pose_id, confidence, False
 
         if warming_up:
             # Record nothing.  Returning the raw verdict is safe because
             # classify() replaces it with INITIALIZING, but clearing here too
             # keeps the contract local: during warmup the gate has no opinion.
+            self._last_gate_streak = 0
             return pose_id, confidence, False
 
         # P01 is recorded so that a return to normal behaviour CLEARS the
@@ -985,6 +1457,9 @@ class PoseClassifier:
         # survive any number of normal frames, so the next single noisy frame
         # would publish an anomaly instantly.
         streak = self._temporal_buffer.note_pose(pose_id)
+        # Published for the HUD's alert-sustain tier: how long the raw rule
+        # has been firing at this id, including frames still below the gate.
+        self._last_gate_streak = streak
 
         if pose_id == "P01":
             return pose_id, confidence, False
@@ -1485,9 +1960,12 @@ class PoseClassifier:
             "body_turn": {"P10", "P11", "P37"},
             "excessive_lean": {"P08", "P09", "P31"},
             "multi_person": {"P35", "P39"},
-            "phone_detected": {"P12"},
+            "phone_detected": {"P12", "P31_PHONE_USABILITY"},
             "note_peeking": {"P13"},
-            "talking": {"P14"},
+            # "talking" deliberately maps to nothing: no rule in this engine
+            # produces a talking verdict (P14 is Looking Down), and mapping
+            # it there made every looking-down alert also claim whispering.
+            "talking": set(),
             "standing": {"P15"},
             "absent": {"P16"},
             "hand_to_mouth": {"P19"},

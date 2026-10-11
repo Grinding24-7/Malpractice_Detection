@@ -17,6 +17,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from desktop_app.core import perf_config
+
 # ── COCO 17-keypoint skeleton connections ──────────────────────────────────
 COCO_SKELETON: list[tuple[int, int]] = [
     (0, 1), (0, 2), (1, 3), (2, 4),
@@ -171,6 +173,48 @@ def render_hud(
     is_system_state = pose_id in ("NO_SIGNAL", "INITIALIZING")
     is_anomaly = pose_id != "P01" and not is_system_state
 
+    # ── Neutral posture + alert sustain tier ────────────────────────────
+    # A benign exam state (writing / thinking / brief glance) renders green
+    # regardless of what the raw rule would have said -- the filter has
+    # already vouched that this is not a finding.
+    neutral_state: str = result.get("neutral_state") or ""
+    neutral_label: str = result.get("neutral_label") or ""
+    # Only vouched for while the published verdict is P01: neutral suppresses
+    # P14/phone specifically, so a different anomaly still published alongside
+    # a neutral reading must keep its own red/amber treatment.
+    neutral_active = (
+        bool(neutral_state)
+        and not is_system_state
+        and pose_id == "P01"
+    )
+
+    temporal = result.get("temporal_metrics", {})
+    # Sustained counts PUBLISHED frames; the raw streak counts frames the
+    # rule has fired at all (including ones the gate is still withholding).
+    # The banner tier reads the larger of the two so a threat that spent its
+    # first 12 frames below the gate still reaches AMBER at frame 30 of
+    # continuous behaviour, not frame 42.
+    sustained = int(temporal.get("sustained_anomaly_frames", 0))
+    raw_streak = int(temporal.get("anomaly_streak", 0))
+    sustain = max(sustained, raw_streak)
+
+    # Threat colouring is earned, not immediate: RED/AMBER only once the
+    # temporal buffer has confirmed the behaviour.  Below that the finding
+    # is already in the sidebar, but the overlay does not paint a threat
+    # the buffer has not yet backed.
+    threat_color: tuple[int, int, int] | None = None
+    if is_anomaly and not neutral_active:
+        if sustain >= perf_config.ALERT_SUSTAIN_FRAMES:
+            if (
+                sustain >= perf_config.ALERT_RED_FRAMES
+                or result.get("confidence", 0) >= perf_config.ALERT_RED_CONFIDENCE
+            ):
+                threat_color = _COLOR_TEXT_R
+            else:
+                threat_color = _COLOR_TEXT_AMBER
+        else:
+            threat_color = _COLOR_TEXT_DIM  # under observation, not yet a threat
+
     # ── 1. Spatial bounding-box vectoring ─────────────────────────────────
     boxes = result.get("bounding_boxes", [])
     spatial = result.get("spatial_features", {})
@@ -184,7 +228,9 @@ def render_hud(
 
     for person_idx, box in enumerate(boxes):
         x1, y1, x2, y2 = box
-        box_color = _COLOR_BOX_ALERT if is_anomaly else _COLOR_BOX_OK
+        # Green for a normal or neutral frame, and for a threat the buffer
+        # has not yet confirmed; red/amber only once sustained.
+        box_color = threat_color if threat_color is not None else _COLOR_BOX_OK
 
         cv2.rectangle(
             overlay,
@@ -194,7 +240,14 @@ def render_hud(
         )
 
         conf_pct = result.get("confidence", 0) * 100
-        label = f"[{pose_id}] Candidate {person_idx + 1} (Conf: {conf_pct:.0f}%)"
+        if neutral_active:
+            # The neutral filter has vouched for this frame: the verdict is
+            # a benign P00 state, not the raw rule's finding.
+            label = (
+                f"[P00] Candidate #{person_idx + 1:02d}: {neutral_label}"
+            )
+        else:
+            label = f"[{pose_id}] Candidate {person_idx + 1} (Conf: {conf_pct:.0f}%)"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         lbl_x = _safe_int(x1)
         lbl_y = max(th + 8, _safe_int(y1) - 8)
@@ -224,9 +277,18 @@ def render_hud(
     cv2.rectangle(overlay, (5, 5), (5 + panel_w, 5 + panel_h), _COLOR_PANEL_BG, -1)
     cv2.rectangle(overlay, (5, 5), (5 + panel_w, 5 + panel_h), _COLOR_PANEL_BD, 1)
 
-    status_color = _COLOR_TEXT_CYAN if is_system_state else (
-        _COLOR_TEXT_R if is_anomaly else _COLOR_TEXT_G
-    )
+    if is_system_state:
+        status_color = _COLOR_TEXT_CYAN
+    elif neutral_active:
+        # Neutral states are the healthy case while the student is writing
+        # or thinking -- green, never the anomaly red.
+        status_color = _COLOR_TEXT_G
+    elif threat_color is not None and threat_color != _COLOR_TEXT_DIM:
+        status_color = threat_color
+    elif is_anomaly:
+        status_color = _COLOR_TEXT_DIM  # under observation, below sustain
+    else:
+        status_color = _COLOR_TEXT_G
     y0 = 28
     cv2.putText(
         overlay, f"Pose: {pose_id} - {result.get('pose_name', '')}",
@@ -249,21 +311,32 @@ def render_hud(
         (14, y0 + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLOR_TEXT_AMBER, 1, cv2.LINE_AA,
     )
 
-    hp = result.get("head_pose", {})
-    cv2.putText(
-        overlay,
-        f"Yaw: {hp.get('yaw', 0.0):.1f}  Pitch: {hp.get('pitch', 0.0):.1f}  Roll: {hp.get('roll', 0.0):.1f}",
-        (14, y0 + 97), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA,
-    )
+    # Neutral state indicator -- the P00 verdict is the headline state while
+    # it is active, shown green so it reads as "fine" rather than "quiet".
+    if neutral_active:
+        cv2.putText(
+            overlay, f"State: {neutral_label} (Neutral)",
+            (14, y0 + 97), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLOR_TEXT_G, 1,
+            cv2.LINE_AA,
+        )
+    else:
+        hp = result.get("head_pose", {})
+        cv2.putText(
+            overlay,
+            f"Yaw: {hp.get('yaw', 0.0):.1f}  Pitch: {hp.get('pitch', 0.0):.1f}  Roll: {hp.get('roll', 0.0):.1f}",
+            (14, y0 + 97), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA,
+        )
 
     # Temporal / sustained anomaly indicator
-    temporal = result.get("temporal_metrics", {})
-    sustained = int(temporal.get("sustained_anomaly_frames", 0))
-    if sustained > 0:
+    if sustain > 0 and is_anomaly:
+        if sustain >= perf_config.ALERT_SUSTAIN_FRAMES:
+            sustain_color = threat_color if threat_color is not None else _COLOR_TEXT_AMBER
+        else:
+            sustain_color = _COLOR_TEXT_DIM
         cv2.putText(
-            overlay, f"Sustained Anomaly: {sustained} frames",
+            overlay, f"Sustained Anomaly: {sustain} frames",
             (14, y0 + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-            (0, 120, 255) if sustained > 15 else _COLOR_TEXT_DIM, 1, cv2.LINE_AA,
+            sustain_color, 1, cv2.LINE_AA,
         )
 
     cv2.putText(
@@ -310,14 +383,35 @@ def render_hud(
             overlay, banner, (bx, 42),
             cv2.FONT_HERSHEY_SIMPLEX, 0.75, _COLOR_TEXT_CYAN, 3, cv2.LINE_AA,
         )
-    elif is_anomaly:
+    elif is_anomaly and sustain >= perf_config.ALERT_SUSTAIN_FRAMES:
+        # Threat colouring is earned: nothing RED/AMBER is shown until the
+        # temporal buffer has confirmed the behaviour past the sustained
+        # threshold.  Below that the finding sits in the sidebar without the
+        # overlay claiming a threat.
+        is_red = (
+            sustain >= perf_config.ALERT_RED_FRAMES
+            or result.get("confidence", 0) >= perf_config.ALERT_RED_CONFIDENCE
+        )
         banner = f"!! ALERT: {pose_id} - {result.get('pose_name', '')} !!"
         (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 3)
         bx = max(10, (w - tw) // 2)
-        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), (0, 0, 180), -1)
+        banner_bg = (0, 0, 180) if is_red else (0, 120, 200)
+        banner_fg = _COLOR_TEXT_W
+        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), banner_bg, -1)
         cv2.putText(
             overlay, banner, (bx, 42),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.9, _COLOR_TEXT_W, 3, cv2.LINE_AA,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, banner_fg, 3, cv2.LINE_AA,
+        )
+    elif neutral_active:
+        # Green P00 banner: the room is being watched and this frame is a
+        # benign, vouched-for posture, not an absence of opinion.
+        banner = f"[P00] {neutral_label} (NEUTRAL - NO ALERT)"
+        (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
+        bx = max(10, (w - tw) // 2)
+        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), (60, 140, 60), -1)
+        cv2.putText(
+            overlay, banner, (bx, 42),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.75, _COLOR_TEXT_W, 3, cv2.LINE_AA,
         )
 
     # ── 4b. Object detection boxes ────────────────────────────────────────

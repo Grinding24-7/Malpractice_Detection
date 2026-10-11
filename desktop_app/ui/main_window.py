@@ -137,6 +137,17 @@ class MainWindow(QMainWindow):
             pose_id, yaw, pitch, roll,
         )
 
+    def _on_neutral_state_changed(self, state: str, label: str) -> None:
+        """Log neutral posture transitions to the console drawer.
+
+        An empty state means the student left the neutral posture (or the
+        camera faulted); either way it ends the previous line's episode.
+        """
+        if state:
+            logger.info("[P00] Candidate #01: %s (Neutral)", label)
+        else:
+            logger.info("[P00] Neutral state cleared")
+
     # ------------------------------------------------------------------
     # Session launch (Hub → Monitoring transition)
     # ------------------------------------------------------------------
@@ -182,6 +193,11 @@ class MainWindow(QMainWindow):
 
         # ── Head state change logging ────────────────────────────────────
         self._worker.head_state_changed.connect(self._on_head_state_changed)
+
+        # ── Neutral posture state logging ────────────────────────────────
+        # Emitted only on transition, so the console gets one line per
+        # neutral state change rather than one per frame.
+        self._worker.neutral_state_changed.connect(self._on_neutral_state_changed)
 
         # ── Start threads ────────────────────────────────────────────────
         self._camera.start()
