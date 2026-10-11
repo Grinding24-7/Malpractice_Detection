@@ -34,7 +34,7 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Poses that are correct answers even on a "normal" clip: an empty seat or an
 # extra person are genuine findings, not noise.
-_ALWAYS_VALID = {"P16", "P17", "P35", "P39"}
+_ALWAYS_VALID = {"P16", "P35"}
 
 # Poses that assert nothing about a student.  They must be excluded from both
 # the false-positive rate and the P01 share, because counting them as misses

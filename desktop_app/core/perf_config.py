@@ -176,6 +176,10 @@ OBJ_ESCALATE_TO: dict[str, tuple[str, float]] = {
     "tablet": ("P38", 0.80),
     "headphones": ("P38", 0.80),
     "book": ("P13", 0.75),
+    # Earbuds get their own verdict: wearing them is a distinct, more
+    # deliberate act than a phone lying on the desk, and P26 is the
+    # taxonomy id reserved for it.
+    "earbuds": ("P26", 0.78),
 }
 
 # ---------------------------------------------------------------------------
@@ -231,6 +235,49 @@ NEUTRAL_GLANCE_MAX_SEC: float = float(
 )
 
 # ---------------------------------------------------------------------------
+# Extended behavioural rules (P23 fidgeting, P25 hidden face, P28 frequent
+# glancing, P29 chin rest)
+# ---------------------------------------------------------------------------
+# All four are geometric/temporal rules on the sensors this system already
+# has (MediaPipe landmarks + head pose + object detections).  None requires
+# eye tracking or audio, which is why they -- and only they -- were added
+# from the original 40-id taxonomy.
+
+# P23 Fidgeting: mean per-frame torso-centre displacement over a rolling
+# window, expressed in shoulder-width units.  A seated student writing or
+# typing moves the torso < 0.02 shoulder-widths per frame; fidgeting
+# (shifting, rocking, re-settling) measures well above that.
+FIDGET_WINDOW: int = int(os.environ.get("IP_FIDGET_WIN", "30"))
+FIDGET_MIN_FRAMES: int = int(os.environ.get("IP_FIDGET_MIN_FRAMES", "20"))
+FIDGET_MIN_DISP: float = float(os.environ.get("IP_FIDGET_MIN_DISP", "0.04"))
+
+# P25 Hidden Face: mean visibility of the face landmarks (nose, eye
+# inners/outers, ears) while both shoulders stay clearly visible.  A face
+# turned away reads vis ~0.0-0.2 on those points; a face genuinely present
+# reads > 0.6.  The shoulder guard stops a distant/blurry full-body frame
+# from being reported as a hidden face.
+HIDDEN_FACE_MAX_VIS: float = float(os.environ.get("IP_HIDDEN_FACE_VIS", "0.35"))
+HIDDEN_FACE_MIN_SHOULDER_VIS: float = float(
+    os.environ.get("IP_HIDDEN_FACE_SHOULDER_VIS", "0.50")
+)
+
+# P28 Frequent Glancing: how many times the head enters the averted-gaze
+# band (|yaw delta| > GLANCE_YAW_DEG) inside GLANCE_WINDOW_SEC.  One glance
+# is P20; repeated entries are a pattern.  Threshold is events, not frames,
+# so a single held turn cannot inflate the count.
+GLANCE_WINDOW_SEC: float = float(os.environ.get("IP_GLANCE_WIN_SEC", "10.0"))
+GLANCE_MIN_EVENTS: int = int(os.environ.get("IP_GLANCE_MIN_EVENTS", "4"))
+GLANCE_YAW_DEG: float = float(os.environ.get("IP_GLANCE_YAW_DEG", "20.0"))
+
+# P29 Chin Rest: wrist-on-cheek held continuously for this long without pen
+# micro-oscillation.  The neutral-thinking state covers the first minute as
+# benign; beyond it the same posture is disengagement.  60 s is well past
+# any normal thinking pause in an exam.
+CHIN_REST_SUSTAINED_SEC: float = float(
+    os.environ.get("IP_CHIN_REST_SEC", "60.0")
+)
+
+# ---------------------------------------------------------------------------
 # Desk object proximity fusion (wrist -> object)
 # ---------------------------------------------------------------------------
 # The concurrent desk-object pass answers a different question from the
@@ -245,6 +292,13 @@ PHONE_WRIST_DIST_PX: float = float(
 )
 # Detection confidence the proximity verdict requires (spec: > 0.6).
 PHONE_MIN_CONF: float = float(os.environ.get("IP_PHONE_CONF", "0.6"))
+
+# Earbud bbox centre to ear-landmark distance under which an earbud is
+# "worn" (P26).  Same pixel-domain caveat as PHONE_WRIST_DIST_PX: tunable
+# per deployment geometry.
+EARBUDS_EAR_DIST_PX: float = float(
+    os.environ.get("IP_EARBUDS_EAR_PX", "80.0")
+)
 
 # Throttle for the concurrent desk-object pass.  It runs on its own thread,
 # so this bounds CPU rather than correctness -- tracks persist between passes.
@@ -419,7 +473,7 @@ ANOMALY_MIN_STREAK_FRAMES: int = int(
 # presence/absence facts that must not be delayed or suppressed: a missing
 # student or an extra person in frame is the most serious finding there is.
 IMMEDIATE_POSES: frozenset[str] = frozenset(
-    {"P16", "P17", "P35", "P39"}
+    {"P16", "P35"}
 )
 
 # Sanity floor, NOT a tuned filter.  The per-rule confidences in

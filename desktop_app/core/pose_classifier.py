@@ -129,17 +129,14 @@ POSE_MAP: dict[str, str] = {
     "P14": "Looking Down",
     "P15": "Standing Up",
     "P16": "Absent Seat",
-    "P17": "Absent + Multiple",
     "P18": "Head on Desk",
     "P19": "Hand to Mouth",
     "P20": "Looking at Neighbor",
     "P21": "Writing Under Desk",
     "P22": "Raising Hand",
     "P23": "Excessive Fidgeting",
-    "P24": "Second Screen Gaze",
     "P25": "Hidden Face",
     "P26": "Earbuds Detected",
-    "P27": "Object Transfer",
     "P28": "Frequent Glancing",
     "P29": "Chin Rest",
     "P30": "Crossed Arms",
@@ -152,13 +149,9 @@ POSE_MAP: dict[str, str] = {
     "P31_PHONE_USABILITY": "Phone Usability",
     "P32": "Backward Lean",
     "P33": "Forward Hunch",
-    "P34": "Eye Gaze Averted",
     "P35": "Multiple Persons",
     "P36": "Head Oscillation",
-    "P37": "Torso Rotation",
     "P38": "Unusual Object",
-    "P39": "Collaboration",
-    "P40": "Other Anomaly",
 }
 
 # Ordered feature names for scikit-learn classifier input vector
@@ -471,6 +464,39 @@ def _obj_within(
     return math.sqrt(dx * dx + dy * dy) <= max_px
 
 
+def _cheek_contact_active(
+    keypoints: list[tuple[float, float, float]] | None,
+    desk_objects: list[dict[str, Any]] | None,
+) -> bool:
+    """True when a visible wrist rests at the cheek with no device near it.
+
+    The same geometry as the NEUTRAL_THINKING test, exposed separately so
+    the P29 chin-rest clock ticks on the identical measurement the neutral
+    filter uses -- the two can never disagree about what "hand at cheek"
+    means.
+    """
+    lms = keypoints or []
+    if len(lms) < 33:
+        return False
+    cheek = _cheek_anchor(lms)
+    if cheek is None:
+        return False
+    for wrist_idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+        wrist = _visible_xy(lms, wrist_idx)
+        if wrist is None:
+            continue
+        if _dist_2d(wrist, cheek) > perf_config.NEUTRAL_THINK_CHEEK_PX:
+            continue
+        if not any(
+            obj.get("label") in _NEUTRAL_DEVICE_LABELS
+            and _obj_within(obj.get("box"), wrist,
+                            perf_config.NEUTRAL_THINK_NO_OBJ_PX)
+            for obj in (desk_objects or [])
+        ):
+            return True
+    return False
+
+
 def _merge_detections(
     primary: list[dict[str, Any]],
     secondary: list[dict[str, Any]],
@@ -511,6 +537,8 @@ class _TemporalBuffer:
         "_pitch_baseline", "_yaw_baseline",
         "_turn_baseline", "_turn_mad",
         "_wrist_hist", "_glance_start",
+        "_torso_hist", "_glance_events", "_yaw_averted_prev",
+        "_cheek_contact_start",
     )
 
     def __init__(self) -> None:
@@ -539,6 +567,17 @@ class _TemporalBuffer:
             maxlen=max(2, perf_config.NEUTRAL_WRIST_OSC_WINDOW)
         )
         self._glance_start: float | None = None
+        # Torso-centre trace (normalised by shoulder width) for the P23
+        # fidget test; a rolling window of averted-yaw event timestamps for
+        # P28; a clock for continuous cheek contact for P29.
+        self._torso_hist: collections.deque[tuple[float, float]] = collections.deque(
+            maxlen=perf_config.FIDGET_WINDOW
+        )
+        self._glance_events: collections.deque[float] = collections.deque(
+            maxlen=64
+        )
+        self._yaw_averted_prev: bool = False
+        self._cheek_contact_start: float | None = None
 
     # ── Baseline tracking ──────────────────────────────────────────────
 
@@ -724,6 +763,62 @@ class _TemporalBuffer:
             self._glance_start = now
             return 0.0
         return max(0.0, now - self._glance_start)
+
+    # ── P23 / P28 / P29 helpers ────────────────────────────────────────
+
+    def note_torso(self, cx: float, cy: float) -> None:
+        """Record the torso centre in shoulder-width units for P23."""
+        self._torso_hist.append((cx, cy))
+
+    def fidget_displacement(self) -> float:
+        """Mean per-frame torso-centre displacement over the window.
+
+        Expressed in shoulder-width units (the caller normalises before
+        recording).  Returns 0.0 when there is too little history to judge,
+        so the opening seconds of a session cannot produce a fidget verdict.
+        """
+        hist = list(self._torso_hist)
+        if len(hist) < perf_config.FIDGET_MIN_FRAMES:
+            return 0.0
+        dists = [
+            math.hypot(hist[i][0] - hist[i - 1][0], hist[i][1] - hist[i - 1][1])
+            for i in range(1, len(hist))
+        ]
+        return float(sum(dists) / len(dists))
+
+    def note_yaw_averted(self, averted: bool, now: float) -> None:
+        """Count entries into the averted-gaze band for P28.
+
+        Only the rising edge counts: holding one turn for ten seconds is a
+        single event, while four separate looks across the same window is a
+        pattern.  Events older than GLANCE_WINDOW_SEC are pruned on read.
+        """
+        if averted and not self._yaw_averted_prev:
+            self._glance_events.append(now)
+        self._yaw_averted_prev = averted
+
+    def glance_event_count(self, now: float | None = None) -> int:
+        """Averted-gance events inside the rolling window."""
+        if now is None:
+            now = time.monotonic()
+        cutoff = now - perf_config.GLANCE_WINDOW_SEC
+        while self._glance_events and self._glance_events[0] < cutoff:
+            self._glance_events.popleft()
+        return len(self._glance_events)
+
+    def update_cheek_contact(self, in_contact: bool, now: float) -> float | None:
+        """Track how long cheek contact has been held continuously (seconds).
+
+        Returns ``None`` whenever contact breaks, and ``0.0`` on the first
+        in-contact frame -- the same contract as ``update_glance``.
+        """
+        if not in_contact:
+            self._cheek_contact_start = None
+            return None
+        if self._cheek_contact_start is None:
+            self._cheek_contact_start = now
+            return 0.0
+        return max(0.0, now - self._cheek_contact_start)
 
     @property
     def is_sustained_anomaly(self) -> bool:
@@ -1015,6 +1110,48 @@ class PoseClassifier:
             return None
         return best
 
+    def _earbuds_worn_hit(
+        self, objects: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """The strongest ear-level earbud evidence in *objects*, if any.
+
+        Mirrors the phone-usability design: the concurrent proximity pass
+        runs on every frame, so this works even when the raw verdict is P01
+        and the anomaly-triggered object pass is correctly skipped.  An
+        earbud bbox centred within EARBUDS_EAR_DIST_PX of a visible ear
+        landmark is "worn"; the same object lying on the desk is not.
+        """
+        if not objects:
+            return None
+        ears = []
+        for idx in (MP_LEFT_EAR, MP_RIGHT_EAR):
+            pt = _visible_xy(self._last_landmarks, idx)
+            if pt is not None:
+                ears.append(pt)
+        if not ears:
+            return None
+        best: dict[str, Any] | None = None
+        best_dist = math.inf
+        for obj in objects:
+            label = str(obj.get("label", "")).lower()
+            if label != "earbuds":
+                continue
+            if float(obj.get("confidence", 0.0)) < perf_config.PHONE_MIN_CONF:
+                continue
+            box = obj.get("box")
+            if not box or len(box) != 4:
+                continue
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            dist = min(_dist_2d(e, (cx, cy)) for e in ears)
+            if dist < best_dist:
+                best_dist = dist
+                best = dict(obj)
+                best["ear_dist"] = round(dist, 1)
+        if best is None or best_dist >= perf_config.EARBUDS_EAR_DIST_PX:
+            return None
+        return best
+
     def classify(self, frame: np.ndarray) -> dict[str, Any]:
         """Classify the frame and return a standardised result dict.
 
@@ -1094,6 +1231,36 @@ class PoseClassifier:
         if turn_ratio is not None:
             self._temporal_buffer.update_turn(turn_ratio)
 
+        # ── P23 / P28 temporal inputs ────────────────────────────────────
+        # Torso centre normalised by shoulder width (P23 fidget), and
+        # rising-edge entries into the averted-gaze band (P28 glancing).
+        # Fed to the buffer before the rule engine reads them, matching the
+        # body-turn ratio contract above so the two can never disagree.
+        lms0 = all_landmarks[0] if all_landmarks else []
+        if (
+            self._last_shoulder_width >= perf_config.MIN_SCALE_PX
+            and len(lms0) >= 33
+        ):
+            ls = _visible_xy(lms0, MP_LEFT_SHOULDER)
+            rs = _visible_xy(lms0, MP_RIGHT_SHOULDER)
+            lh = _visible_xy(lms0, MP_LEFT_HIP)
+            rh = _visible_xy(lms0, MP_RIGHT_HIP)
+            if ls and rs and lh and rh:
+                sw = max(self._last_shoulder_width, 1e-6)
+                cx = (ls[0] + rs[0] + lh[0] + rh[0]) / (4.0 * sw)
+                cy = (ls[1] + rs[1] + lh[1] + rh[1]) / (4.0 * sw)
+                self._temporal_buffer.note_torso(cx, cy)
+        self._temporal_buffer.note_yaw_averted(
+            abs(head_pose["yaw"] - yaw_baseline) > perf_config.GLANCE_YAW_DEG,
+            time.monotonic(),
+        )
+        temporal_metrics["fidget_disp"] = (
+            self._temporal_buffer.fidget_displacement()
+        )
+        temporal_metrics["glance_events"] = float(
+            self._temporal_buffer.glance_event_count()
+        )
+
         # ── Spatial features ─────────────────────────────────────────────
         spatial = self._compute_spatial_features(yolo_boxes, frame.shape)
 
@@ -1151,6 +1318,26 @@ class PoseClassifier:
             # gate like every other anomaly below.
             pose_id = "P31_PHONE_USABILITY"
             confidence = max(confidence, 0.85)
+        elif self._earbuds_worn_hit(objects_detected):
+            # Worn, not merely present: the earbud bbox must sit at an ear
+            # landmark.  Same design as the phone-usability rule -- the
+            # concurrent proximity pass runs on every frame, so a student
+            # sitting normally (P01) while wearing earbuds is still caught,
+            # which the anomaly-triggered escalation path alone would miss.
+            pose_id = "P26"
+            confidence = max(confidence, 0.78)
+
+        # ── P29 chin-rest clock ──────────────────────────────────────────
+        # Ticks every frame on the same cheek-contact geometry the neutral
+        # filter uses, so the two can never disagree.  Contact held past
+        # CHIN_REST_SUSTAINED_SEC stops being "thinking" and becomes P29;
+        # the neutral filter does not suppress it (it is not in
+        # _NEUTRAL_SUPPRESSES) -- the first minute is benign, the next hour
+        # is disengagement, and both are real findings.
+        cheek_elapsed = self._temporal_buffer.update_cheek_contact(
+            _cheek_contact_active(self._last_landmarks, objects_detected),
+            time.monotonic(),
+        )
 
         # ── Positive neutral posture filter ─────────────────────────────
         # Evaluated before the gate so a suppressed threat never accumulates
@@ -1173,6 +1360,18 @@ class PoseClassifier:
                 "neutral %s suppresses %s", neutral_state, pose_id
             )
             pose_id, confidence = "P01", 0.95
+
+        # ── P29 chin rest (sustained cheek contact) ──────────────────────
+        # Applied after the neutral filter so a suppressed P14/P31 cannot
+        # mask it, and only over benign verdicts -- a real anomaly already
+        # standing (P16, P35, P15 ...) outranks a posture observation.
+        if (
+            cheek_elapsed is not None
+            and cheek_elapsed >= perf_config.CHIN_REST_SUSTAINED_SEC
+            and pose_id in ("P01",)
+        ):
+            temporal_metrics["chin_rest_sec"] = cheek_elapsed
+            pose_id, confidence = "P29", 0.70
 
         # ── Temporal / confidence gate ───────────────────────────────────
         # Applied to the FINAL verdict, so an object-driven escalation is held
@@ -1810,6 +2009,29 @@ class PoseClassifier:
         shoulder_w = abs(_lm(MP_LEFT_SHOULDER)[0] - _lm(MP_RIGHT_SHOULDER)[0])
         have_scale = shoulder_w >= perf_config.MIN_SCALE_PX
 
+        # ── P25 Hidden Face ──────────────────────────────────────────────
+        # Face landmarks (nose / eyes / ears) invisible while both shoulders
+        # stay clearly visible: the student is in frame but their face is
+        # occluded -- hand, hair, mask, coat collar, head buried.  Sits
+        # BEFORE every head-pose and yaw/pitch rule because solvePnP on an
+        # occluded face produces confident garbage, so the rules below must
+        # not be trusted once the face is gone.
+        face_idx = (
+            MP_NOSE, MP_LEFT_EYE_INNER, MP_LEFT_EYE_OUTER,
+            MP_RIGHT_EYE_INNER, MP_RIGHT_EYE_OUTER, MP_LEFT_EAR, MP_RIGHT_EAR,
+        )
+        face_vis_vals = [
+            lms[i][2] for i in face_idx
+            if len(lms) > i and lms[i][2] is not None
+        ]
+        if face_vis_vals and _visible(MP_LEFT_SHOULDER,
+                                      perf_config.HIDDEN_FACE_MIN_SHOULDER_VIS) \
+                and _visible(MP_RIGHT_SHOULDER,
+                             perf_config.HIDDEN_FACE_MIN_SHOULDER_VIS):
+            face_vis = sum(face_vis_vals) / len(face_vis_vals)
+            if face_vis < perf_config.HIDDEN_FACE_MAX_VIS:
+                return ("P25", 0.75)
+
         # ── 3D Head Pose anomalies (from HeadPoseEstimator) ──────────────
         if "P12_LOOKING_AWAY" in head_anomalies:
             return ("P12", 0.88)
@@ -1939,6 +2161,25 @@ class PoseClassifier:
         if temporal.get("yaw_variance", 0) > 400:
             return ("P36", 0.78)
 
+        # ── P28 Frequent Glancing ────────────────────────────────────────
+        # Rising-edge entries into the averted-gaze band (|yaw delta| >
+        # GLANCE_YAW_DEG) inside the rolling window.  A single look is P20
+        # below; four separate looks in ten seconds is a pattern.  Counts
+        # events, not frames, so one held turn cannot inflate the total.
+        if temporal.get("glance_events", 0) >= float(
+            perf_config.GLANCE_MIN_EVENTS
+        ):
+            return ("P28", 0.72)
+
+        # ── P23 Excessive Fidgeting ──────────────────────────────────────
+        # Mean per-frame torso-centre displacement in shoulder-width units,
+        # over the rolling window.  A seated student writing or typing moves
+        # well under FIDGET_MIN_DISP per frame; shifting, rocking and
+        # re-settling clear it easily, and the stability gate requires the
+        # motion to persist before it is published.
+        if temporal.get("fidget_disp", 0.0) > perf_config.FIDGET_MIN_DISP:
+            return ("P23", 0.72)
+
         # ── Looking at neighbor ──────────────────────────────────────────
         # Relative to the student's neutral yaw, and deliberately low
         # confidence: this is a weak signal that must not survive the gate on
@@ -1957,9 +2198,9 @@ class PoseClassifier:
     def _build_flags(pose_id: str) -> dict[str, bool]:
         flag_map = {
             "head_down": {"P06", "P18"},
-            "body_turn": {"P10", "P11", "P37"},
+            "body_turn": {"P10", "P11"},
             "excessive_lean": {"P08", "P09", "P31"},
-            "multi_person": {"P35", "P39"},
+            "multi_person": {"P35"},
             "phone_detected": {"P12", "P31_PHONE_USABILITY"},
             "note_peeking": {"P13"},
             # "talking" deliberately maps to nothing: no rule in this engine
@@ -1975,5 +2216,10 @@ class PoseClassifier:
             "head_oscillation": {"P36"},
             "looking_away": {"P12"},
             "looking_down": {"P14"},
+            "hidden_face": {"P25"},
+            "fidgeting": {"P23"},
+            "frequent_glancing": {"P28"},
+            "chin_rest": {"P29"},
+            "earbuds": {"P26"},
         }
         return {flag: (pose_id in poses) for flag, poses in flag_map.items()}

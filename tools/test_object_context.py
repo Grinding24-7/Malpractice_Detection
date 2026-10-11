@@ -526,7 +526,7 @@ def test_object_context_wanted() -> bool:
     for pose in ("NO_SIGNAL", "INITIALIZING"):
         ok &= check(f"{pose} (black/starting feed) -> no object pass",
                     not wants(pose))
-    for pose in ("P16", "P17", "P35", "P39"):
+    for pose in ("P16", "P35"):
         ok &= check(f"{pose} (presence verdict) -> no object pass",
                     not wants(pose))
     ok &= check("P01 (no anomaly) -> no object pass", not wants("P01"))

@@ -161,7 +161,7 @@ def main() -> int:
                 _NEUTRAL_SUPPRESSES == {"P14", "P31_PHONE_USABILITY"},
                 f"got {sorted(_NEUTRAL_SUPPRESSES)}")
     ok &= check("presence verdicts are never suppressible",
-                not (_NEUTRAL_SUPPRESSES & {"P16", "P17", "P35", "P39"}))
+                not (_NEUTRAL_SUPPRESSES & {"P16", "P35"}))
     ok &= check("every neutral state has a HUD label",
                 set(NEUTRAL_LABELS) == {NEUTRAL_WRITING, NEUTRAL_THINKING,
                                         NEUTRAL_GLANCE})

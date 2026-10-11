@@ -38,7 +38,7 @@ Supporting pieces:
 
 Each alert carries a severity: `low` / `medium` / `high`.
 
-**Desktop P01–P40:** head turn (L/R, 30°/60°), head down/up, lean, body turn, looking away, note peeking, talking, standing, absent seat, head on desk, hand to mouth, writing under desk, second-screen gaze, hidden face, earbuds, object transfer, frequent glancing, crossed arms, multiple persons, unusual object, collaboration, and more.
+**Desktop P01–P38 (reachable set):** head turn (L/R, 30°/60°), head down/up, lean, body turn, looking away, note peeking, looking down, standing, absent seat, head on desk, hand to mouth, writing under desk, frequent glancing, chin rest, crossed arms, multiple persons, unusual object, phone usability. IDs P17/P24/P27/P34/P37/P39/P40 were removed — no sensor in this system can measure them.
 
 Object rules combine desk-region detection with spatial relations (`in_hand`, `reachable`, `lap`, `away`), nearest-person attribution, persistence tracks, and confidence/stability gates.
 

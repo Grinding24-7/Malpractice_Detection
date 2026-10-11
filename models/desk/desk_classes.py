@@ -27,6 +27,7 @@ DESK_CLASSES: list[str] = [
     "tablet",
     "headphones",
     "sheet_of_paper_stack",  # a stack of loose paper / printed pack
+    "earbuds",               # appended (id 13); wired to P26 Earbuds
 ]
 
 # Objects that are individually innocent but become evidence only in
@@ -40,7 +41,7 @@ AMBIENT_CLASSES: frozenset[str] = frozenset({
 # Classes that indicate a device or a prohibited aid regardless of context.
 # Kept for the escalation rules, not for detection.
 DEVICE_CLASSES: frozenset[str] = frozenset({
-    "cell_phone", "laptop", "tablet", "headphones",
+    "cell_phone", "laptop", "tablet", "headphones", "earbuds",
 })
 
 

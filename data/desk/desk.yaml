@@ -26,5 +26,6 @@ names:
   8: cell_phone
   9: laptop
   10: tablet
-  11: headphones
-  12: sheet_of_paper_stack
+    11: headphones
+    12: sheet_of_paper_stack
+    13: earbuds

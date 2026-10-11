@@ -231,7 +231,7 @@ def main() -> int:
         )
         ok &= check(
             "no proctoring verdict issued while the source was dead",
-            not any(p in ("P16", "P17") for p in poses),
+            not any(p in ("P16",) for p in poses),
         )
     ok &= check("operator was told the room is not monitored",
                 "NOT" in joined and "monitored" in joined)

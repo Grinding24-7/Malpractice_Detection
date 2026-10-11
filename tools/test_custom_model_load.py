@@ -2,11 +2,12 @@
 
 tools/test_object_context.py proves class adoption from a stub with a
 ``names`` dict.  That is one step short of the contract that matters: a
-trained desk_objects.pt must load, be recognised as custom, adopt all 13
-desk classes (including ``exam_paper`` at id 0), win over the stock COCO
+trained desk_objects.pt must load, be recognised as custom, adopt all desk
+classes (including ``exam_paper`` at id 0), win over the stock COCO
 weights, and survive an actual detect() pass.
 
-This builds a tiny untrained model with nc=13 in a temp directory and runs
+This builds a tiny untrained model with nc=len(DESK_CLASSES) in a temp
+directory and runs
 it through ObjectContext.load()/detect(), so the test exercises the same
 code path a trained model will -- without needing labelled data or a GPU.
 
@@ -50,7 +51,8 @@ def check(label: str, condition: bool, detail: str = "") -> bool:
 
 
 def build_desk_checkpoint(path: pathlib.Path) -> None:
-    """Create a real (untrained) 13-class YOLO checkpoint at *path*.
+    """Create a real (untrained) YOLO checkpoint with len(DESK_CLASSES)
+    classes at *path*.
 
     Built from the stock architecture YAML with nc overridden, then named
     exactly as models/desk/desk_classes.py defines them -- the same layout
@@ -83,7 +85,7 @@ def build_desk_checkpoint(path: pathlib.Path) -> None:
 
 
 def test_custom_checkpoint_loads() -> bool:
-    """1. a desk_objects.pt is adopted as custom, with all 13 classes"""
+    """1. a desk_objects.pt is adopted as custom, with all desk classes"""
     print("1. real checkpoint loads as a custom desk model")
     ok = True
 
@@ -91,7 +93,8 @@ def test_custom_checkpoint_loads() -> bool:
         tmp_path = pathlib.Path(tmp)
         ckpt = tmp_path / "desk_objects.pt"
         build_desk_checkpoint(ckpt)
-        ok &= check("synthetic nc=13 checkpoint written", ckpt.is_file())
+        ok &= check(f"synthetic checkpoint written (nc={len(DESK_CLASSES)})",
+                    ckpt.is_file())
 
         ctx = ObjectContext()
         model = ctx.load("desk_objects.pt", "yolo11n.pt", (tmp,))
@@ -148,13 +151,13 @@ def test_precedence_and_fallback() -> bool:
         custom_ctx.load("desk_objects.pt", "yolo11n.pt", (tmp,))
         ok &= check(
             "custom desk model preferred when both are present",
-            custom_ctx.is_custom and len(custom_ctx.class_map) == 13,
+            custom_ctx.is_custom and len(custom_ctx.class_map) == len(DESK_CLASSES),
             f"is_custom={custom_ctx.is_custom} "
             f"classes={len(custom_ctx.class_map)}",
         )
 
         # Remove the custom model: the stock weights must then load and
-        # report the COCO map, NOT a stale 13-class map.
+        # report the COCO map, NOT a stale desk-class map.
         (tmp_path / "desk_objects.pt").unlink()
         stock_ctx = ObjectContext()
         stock_ctx.load("desk_objects.pt", "yolo11n.pt", (tmp,))
