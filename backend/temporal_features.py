@@ -455,8 +455,11 @@ def save_dataset(
     """
     path = Path(path)
     extractor = extractor or TemporalFeatureExtractor()
-    X = extractor.extract_batch(np.stack(windows))
-    summaries = extractor.summarize_batch(np.stack(windows))
+    # Stack once: extract_batch and summarize_batch used to each call
+    # np.stack(windows), doubling peak host memory for no benefit.
+    stacked = np.stack(windows)
+    X = extractor.extract_batch(stacked)
+    summaries = extractor.summarize_batch(stacked)
     label_arr = (
         np.asarray(labels, dtype=np.int64) if labels is not None else None
     )

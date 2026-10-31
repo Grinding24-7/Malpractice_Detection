@@ -8,9 +8,9 @@ dependencies = [
     "kagglehub>=1.0.2",
     "lap>=0.5.12",
     "numpy",
-    "opencv-python-headless==4.13.0.92",
+    "opencv-python>=4.13",
     "pandas>=3.0.5",
-    "ultralytics==8.4.108",
+    "ultralytics==8.4.142",
     # Week 6: FastAPI streaming layer
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -22,9 +22,19 @@ dependencies = [
     "matplotlib>=3.11.1",
     "seaborn>=0.13.2",
     "xgboost>=3.2.0",
-    "scikit-learn>=1.9.0",
+    "scikit-learn>=1.9.1",
     # Desktop app + pose classifier training
-    "torch>=2.0",
-    "mediapipe>=1.0",
-    "PyQt6>=6.5",
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "mediapipe==1.0.1",
+    "PyQt6==6.11.0",
 ]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

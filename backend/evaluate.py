@@ -48,6 +48,7 @@ from temporal_training import (
     train_baseline,
     train_sequence_model,
 )
+from runtime import autocast, dataloader_kwargs
 
 logger = logging.getLogger("evaluate")
 
@@ -241,15 +242,16 @@ def _evaluate_deep(
             torch.from_numpy(y_test).long(),
         ),
         batch_size=64, shuffle=False,
+        **dataloader_kwargs(device),
     )
 
     model.eval()
     t1 = time.monotonic()
     y_true_all: list[int] = []
     y_pred_all: list[int] = []
-    with torch.no_grad():
+    with torch.inference_mode(), autocast(device):
         for xb, yb in test_loader:
-            xb = xb.to(device)
+            xb = xb.to(device, non_blocking=device.type == "cuda")
             preds = model(xb).argmax(dim=1).cpu().tolist()
             y_pred_all.extend(preds)
             y_true_all.extend(yb.tolist())

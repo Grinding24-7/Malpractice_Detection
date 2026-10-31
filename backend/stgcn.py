@@ -29,6 +29,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from backend.runtime import autocast, is_cuda, optimize_cuda, resolve_device
+except ImportError:  # pragma: no cover - direct module execution
+    from runtime import (  # type: ignore[no-redef]
+        autocast,
+        is_cuda,
+        optimize_cuda,
+        resolve_device,
+    )
+
 
 # -----------------------------------------------------------------------
 # COCO 17-keypoint skeleton graph adjacency
@@ -197,9 +207,11 @@ class STGCNClassifier:
     LABELS = ["normal", "interaction", "paper_pass", "phone_pass"]
 
     def __init__(self, model_path: Optional[str] = None) -> None:
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = resolve_device("auto")
+        optimize_cuda(self.device)
         self.model = STGCN().to(self.device)
         self.model.eval()
+        self._amp = is_cuda(self.device)
 
         # Pre-built adjacency matrix as tensor
         self.adj = torch.tensor(ADJACENCY, dtype=torch.float32, device=self.device)
@@ -214,7 +226,7 @@ class STGCNClassifier:
         else:
             self._has_weights = False
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, skeleton_sequence: np.ndarray) -> tuple[str, float]:
         """Classify a skeleton sequence.
 
@@ -228,15 +240,19 @@ class STGCNClassifier:
         if not self._has_weights:
             return ("normal", 0.0)
 
-        # Prepare tensor: (1, 3, T, V)
-        seq = torch.tensor(skeleton_sequence, dtype=torch.float32, device=self.device)
+        # Prepare tensor: (1, 3, T, V).  from_numpy avoids an intermediate
+        # Python list; non_blocking overlaps the copy with the first kernel.
+        seq = torch.from_numpy(
+            np.ascontiguousarray(skeleton_sequence, dtype=np.float32)
+        ).to(self.device, non_blocking=is_cuda(self.device))
         if seq.ndim == 3:
             seq = seq.permute(2, 0, 1).unsqueeze(0)  # (1, C, T, V)
         elif seq.ndim == 4:
             seq = seq.unsqueeze(0)
 
-        logits = self.model(seq, self.adj)
-        probs = F.softmax(logits, dim=-1)
+        with autocast(self.device, enabled=self._amp):
+            logits = self.model(seq, self.adj)
+        probs = F.softmax(logits.float(), dim=-1)
         conf, idx = probs.max(dim=-1)
         label = self.LABELS[idx.item()] if idx.item() < len(self.LABELS) else "unknown"
         return (label, conf.item())

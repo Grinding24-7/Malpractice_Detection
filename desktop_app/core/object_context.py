@@ -34,6 +34,15 @@ import numpy as np
 
 from desktop_app.core import perf_config
 
+try:
+    from backend.runtime import optimize_cuda, resolve_device, yolo_device
+except ImportError:  # pragma: no cover - direct module execution
+    from runtime import (  # type: ignore[no-redef]
+        optimize_cuda,
+        resolve_device,
+        yolo_device,
+    )
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -180,6 +189,11 @@ class ObjectContext:
         self.class_map: dict[int, str] = dict(OBJ_CLASS_MAP)
         self.is_custom: bool = False
         self.model_path: str = ""
+        self.device = resolve_device(perf_config.INFERENCE_DEVICE)
+        self.device_arg: str = yolo_device(self.device)
+        self.half: bool = (
+            bool(perf_config.INFERENCE_HALF) and self.device.type == "cuda"
+        )
 
         # Persistence / throttle.
         self.tracks: dict[str, list[dict[str, Any]]] = {}
@@ -230,8 +244,15 @@ class ObjectContext:
             return None
 
         try:
+            optimize_cuda(self.device)
             model = YOLO(str(path))
-            _ = model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+            _ = model(
+                np.zeros((640, 640, 3), dtype=np.uint8),
+                imgsz=perf_config.OBJ_IMGSZ,
+                device=self.device_arg,
+                quantize=16 if self.half else None,
+                verbose=False,
+            )
         except Exception as exc:
             logger.warning("Failed to load object detector %s: %s", path, exc)
             return None
@@ -645,6 +666,8 @@ class ObjectContext:
                 crop,
                 imgsz=imgsz if imgsz is not None else perf_config.OBJ_IMGSZ,
                 conf=conf if conf is not None else perf_config.OBJ_CONF_THRESHOLD,
+                device=self.device_arg,
+                quantize=16 if self.half else None,
                 verbose=False,
             )
             r = results[0]

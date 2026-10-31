@@ -286,10 +286,12 @@ class _PyTorchJITWrapper:
             return None
 
         try:
-            tensor = torch.from_numpy(input_array).to(self._device)
-            with torch.no_grad():
+            tensor = torch.from_numpy(input_array).to(
+                self._device, non_blocking=self._device.type == "cuda"
+            )
+            with torch.inference_mode():
                 output = self._traced(tensor)
-            return output.cpu().numpy()
+            return output.float().cpu().numpy()
         except Exception as e:
             logger.error(f"[pytorch] inference error: {e}")
             return None

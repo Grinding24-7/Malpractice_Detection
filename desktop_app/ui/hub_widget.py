@@ -10,6 +10,8 @@ widget to the live monitoring dashboard.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
@@ -17,6 +19,7 @@ from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -27,6 +30,8 @@ from PyQt6.QtWidgets import (
 )
 
 from desktop_app.core.camera_thread import CameraThread
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class _RtspTestWorker(QThread):
@@ -59,6 +64,7 @@ class HubWidget(QWidget):
         self._camera: CameraThread | None = None
         self._camera_running = False
         self._rtsp_test_worker: _RtspTestWorker | None = None
+        self._syncing = False
         self._build_ui()
         self._refresh_devices()
 
@@ -127,6 +133,20 @@ class HubWidget(QWidget):
         cam_col.addWidget(self.device_combo)
         form.addLayout(cam_col)
 
+        # Detection mode
+        mode_col = QVBoxLayout()
+        mode_col.setSpacing(4)
+        mode_lbl = QLabel("Detection Mode")
+        mode_lbl.setStyleSheet(self._LABEL_STYLE)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setStyleSheet(self._INPUT_STYLE)
+        self.mode_combo.setMinimumWidth(200)
+        self.mode_combo.addItem("Head count (SCUT-HEAD)", "head")
+        self.mode_combo.addItem("P01–P38 pose rules", "pose")
+        mode_col.addWidget(mode_lbl)
+        mode_col.addWidget(self.mode_combo)
+        form.addLayout(mode_col)
+
         root.addLayout(form)
 
         # ── RTSP / CCTV Stream URL ───────────────────────────────────────
@@ -152,6 +172,42 @@ class HubWidget(QWidget):
         rtsp_row.addWidget(self.test_rtsp_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
         root.addLayout(rtsp_row)
+
+        # ── Image folder / manifest replay ───────────────────────────────
+        replay_row = QHBoxLayout()
+        replay_row.setSpacing(12)
+
+        replay_col = QVBoxLayout()
+        replay_col.setSpacing(4)
+        replay_lbl = QLabel("Image Folder / Replay List (SCUT-HEAD)")
+        replay_lbl.setStyleSheet(self._LABEL_STYLE)
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText(
+            r"datasets\SCUT_HEAD\yolo\replay\A_test.txt or an image folder"
+        )
+        self.folder_input.setStyleSheet(self._INPUT_STYLE)
+        self.folder_input.setMinimumWidth(320)
+        replay_col.addWidget(replay_lbl)
+        replay_col.addWidget(self.folder_input)
+        replay_row.addLayout(replay_col, stretch=1)
+
+        self.browse_folder_btn = QPushButton("Browse Folder")
+        self.browse_folder_btn.setStyleSheet(self._SECONDARY_BTN_STYLE)
+        self.browse_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.browse_folder_btn.clicked.connect(self._on_browse_folder)
+        replay_row.addWidget(
+            self.browse_folder_btn, alignment=Qt.AlignmentFlag.AlignBottom
+        )
+
+        self.scut_test_btn = QPushButton("Use SCUT-HEAD Test")
+        self.scut_test_btn.setStyleSheet(self._SECONDARY_BTN_STYLE)
+        self.scut_test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.scut_test_btn.clicked.connect(self._on_use_scut_test)
+        replay_row.addWidget(
+            self.scut_test_btn, alignment=Qt.AlignmentFlag.AlignBottom
+        )
+
+        root.addLayout(replay_row)
 
         # ── Camera toggle + Refresh ──────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -216,6 +272,7 @@ class HubWidget(QWidget):
 
         # ── Connect RTSP input ↔ webcam dropdown exclusivity ─────────────
         self.rtsp_input.textChanged.connect(self._on_rtsp_text_changed)
+        self.folder_input.textChanged.connect(self._on_folder_text_changed)
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
 
     # ------------------------------------------------------------------
@@ -223,14 +280,92 @@ class HubWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_rtsp_text_changed(self, text: str) -> None:
-        """When RTSP URL is typed, disable webcam dropdown."""
+        """RTSP, image replay and webcam are mutually exclusive sources."""
+        if self._syncing:
+            return
         has_rtsp = bool(text.strip())
-        self.device_combo.setEnabled(not has_rtsp)
+        if has_rtsp:
+            self._syncing = True
+            self.folder_input.clear()
+            self.folder_input.setEnabled(False)
+            self._syncing = False
+        else:
+            self.folder_input.setEnabled(True)
+        self.device_combo.setEnabled(
+            not has_rtsp and not self.folder_input.text().strip()
+        )
+
+    def _on_folder_text_changed(self, text: str) -> None:
+        """Selecting a dataset folder/list disables the live sources."""
+        if self._syncing:
+            return
+        has_folder = bool(text.strip())
+        if has_folder:
+            self._syncing = True
+            self.rtsp_input.clear()
+            self.rtsp_input.setEnabled(False)
+            self._syncing = False
+        else:
+            self.rtsp_input.setEnabled(True)
+        self.device_combo.setEnabled(
+            not has_folder and not self.rtsp_input.text().strip()
+        )
 
     def _on_device_changed(self, index: int) -> None:
-        """When a webcam is selected, clear RTSP field."""
+        """When a webcam is selected, clear the file/stream sources."""
+        if self._syncing:
+            return
         if index >= 0:
+            self._syncing = True
             self.rtsp_input.clear()
+            self.folder_input.clear()
+            self.rtsp_input.setEnabled(True)
+            self.folder_input.setEnabled(True)
+            self._syncing = False
+            self.device_combo.setEnabled(True)
+
+    def _on_browse_folder(self) -> None:
+        start = str(_PROJECT_ROOT / "datasets")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select an image folder or replay-list folder", start
+        )
+        if folder:
+            self.folder_input.setText(folder)
+            self.mode_combo.setCurrentIndex(0)
+            self.status_label.setText(f"Image replay source: {folder}")
+
+    def _on_use_scut_test(self) -> None:
+        candidates = [
+            _PROJECT_ROOT / "datasets" / "SCUT_HEAD" / "yolo" / "replay" / "A_test.txt",
+            _PROJECT_ROOT / "datasets" / "SCUT_HEAD" / "yolo" / "replay" / "B_test.txt",
+            _PROJECT_ROOT / "datasets" / "SCUT_HEAD" / "PartA" / "SCUT_HEAD_Part_A" / "JPEGImages",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                self.folder_input.setText(str(candidate))
+                self.mode_combo.setCurrentIndex(0)
+                self.status_label.setText(
+                    f"SCUT-HEAD replay source selected: {candidate.name}"
+                )
+                self.status_label.setStyleSheet(
+                    "color: #3fb950; font-size: 11px; margin-top: 4px;"
+                )
+                return
+        self.status_label.setText(
+            "SCUT-HEAD not found — run tools/scut_head_ingest.py, "
+            "then tools/scut_head_export.py"
+        )
+        self.status_label.setStyleSheet(
+            "color: #f85149; font-size: 11px; margin-top: 4px;"
+        )
+
+    def _refresh_source_enabled(self) -> None:
+        """Re-apply source exclusivity after start/stop toggles."""
+        has_folder = bool(self.folder_input.text().strip())
+        has_rtsp = bool(self.rtsp_input.text().strip())
+        self.folder_input.setEnabled(True)
+        self.rtsp_input.setEnabled(not has_folder)
+        self.device_combo.setEnabled(not has_folder and not has_rtsp)
 
     # ------------------------------------------------------------------
     # RTSP connectivity test
@@ -263,6 +398,7 @@ class HubWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _refresh_devices(self) -> None:
+        self._syncing = True
         self.device_combo.clear()
         devices = CameraThread.probe_devices()
         if not devices:
@@ -278,6 +414,7 @@ class HubWidget(QWidget):
             self.status_label.setStyleSheet(
                 "color: #8b949e; font-size: 11px; margin-top: 4px;"
             )
+        self._syncing = False
 
     # ------------------------------------------------------------------
     # Camera toggle
@@ -290,12 +427,20 @@ class HubWidget(QWidget):
             self._start_camera()
 
     def _get_camera_source(self) -> str | int:
-        """Determine camera source from RTSP input or webcam dropdown."""
+        """Resolve the selected source: image replay, RTSP, then webcam."""
+        folder = self.folder_input.text().strip()
+        if folder:
+            return folder
         rtsp_url = self.rtsp_input.text().strip()
         if rtsp_url:
             return rtsp_url
         data = self.device_combo.currentData()
         return data if isinstance(data, int) else -1
+
+    def detection_mode(self) -> str:
+        """Return "head" or "pose" for the selected analysis mode."""
+        data = self.mode_combo.currentData()
+        return str(data) if data in ("head", "pose") else "head"
 
     def _start_camera(self) -> None:
         source = self._get_camera_source()
@@ -311,9 +456,13 @@ class HubWidget(QWidget):
         self.toggle_btn.setStyleSheet(self._TOGGLE_BTN_STOP_STYLE)
         self.device_combo.setEnabled(False)
         self.rtsp_input.setEnabled(False)
+        self.folder_input.setEnabled(False)
+        self.browse_folder_btn.setEnabled(False)
+        self.scut_test_btn.setEnabled(False)
+        self.mode_combo.setEnabled(False)
         self.test_rtsp_btn.setEnabled(False)
         self.launch_btn.setEnabled(True)
-        self.status_label.setText("Camera starting...")
+        self.status_label.setText("Source starting...")
         self.status_label.setStyleSheet(
             "color: #8b949e; font-size: 11px; margin-top: 4px;"
         )
@@ -328,9 +477,11 @@ class HubWidget(QWidget):
 
         self.toggle_btn.setText("  START CAMERA  ")
         self.toggle_btn.setStyleSheet(self._TOGGLE_BTN_STYLE)
-        self.device_combo.setEnabled(True)
-        self.rtsp_input.setEnabled(True)
+        self.browse_folder_btn.setEnabled(True)
+        self.scut_test_btn.setEnabled(True)
+        self.mode_combo.setEnabled(True)
         self.test_rtsp_btn.setEnabled(True)
+        self._refresh_source_enabled()
         self.launch_btn.setEnabled(False)
         self.preview_label.clear()
         self.preview_label.setText("Camera preview will appear here")

@@ -47,6 +47,21 @@ from desktop_app.core.object_context import (
     shoulder_width_of,
 )
 
+try:
+    from backend.runtime import (
+        empty_cache,
+        optimize_cuda,
+        resolve_device,
+        yolo_device,
+    )
+except ImportError:  # pragma: no cover - direct module execution
+    from runtime import (  # type: ignore[no-redef]
+        empty_cache,
+        optimize_cuda,
+        resolve_device,
+        yolo_device,
+    )
+
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -838,6 +853,10 @@ class PoseClassifier:
 
     def __init__(self) -> None:
         self._yolo: Any = None
+        self._device = resolve_device(perf_config.INFERENCE_DEVICE)
+        self._device_arg = yolo_device(self._device)
+        self._half = bool(perf_config.INFERENCE_HALF) and self._device.type == "cuda"
+        optimize_cuda(self._device)
         # Desk-object detector: a custom desk model when one is present,
         # otherwise the COCO-80 fallback.  `_obj_class_map` is what is
         # actually filtered on, so a custom model's classes apply without
@@ -894,11 +913,46 @@ class PoseClassifier:
 
             model_path = _BACKEND_DIR / "yolo11n-pose.pt"
             self._yolo = YOLO(str(model_path))
-            _ = self._yolo(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
-            logger.info("YOLO11n-pose loaded from %s", model_path)
+            _ = self._yolo(
+                np.zeros((640, 640, 3), dtype=np.uint8),
+                imgsz=perf_config.POSE_IMGSZ,
+                device=self._device_arg,
+                quantize=16 if self._half else None,
+                verbose=False,
+            )
+            logger.info(
+                "YOLO11n-pose loaded from %s (%s%s)",
+                model_path,
+                self._device.type,
+                ", FP16" if self._half else "",
+            )
         except Exception as exc:
             logger.error("Failed to load YOLO: %s", exc)
             self._yolo = None
+
+    def release(self) -> None:
+        """Drop model references so a mode switch can reclaim VRAM.
+
+        Called by the inference thread on shutdown.  Without it the YOLO and
+        MediaPipe objects stay reachable from the stopped thread until the
+        next GC pass, and the CUDA caching allocator keeps their blocks
+        reserved while the head-occupancy mode loads another model.
+        """
+        self._yolo = None
+        self._obj_model = None
+        ctx = getattr(self, "_obj_ctx", None)
+        if ctx is not None:
+            ctx.model = None
+        landmarker = getattr(self, "_pose_landmarker", None)
+        if landmarker is not None:
+            close = getattr(landmarker, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # pragma: no cover - native teardown
+                    logger.debug("MediaPipe landmarker close failed: %s", exc)
+        self._pose_landmarker = None
+        empty_cache(getattr(self, "_device", None))
 
     def _ensure_obj_context(self) -> ObjectContext:
         """The shared desk-object component (created on first use).
@@ -1503,6 +1557,8 @@ class PoseClassifier:
                 frame,
                 imgsz=perf_config.POSE_IMGSZ,
                 max_det=perf_config.POSE_MAX_DET,
+                device=self._device_arg,
+                quantize=16 if self._half else None,
                 verbose=False,
             )
             r = results[0]

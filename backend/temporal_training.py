@@ -40,11 +40,32 @@ import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+try:  # package import (python -m backend.temporal_training)
+    from backend.runtime import (
+        autocast,
+        dataloader_kwargs,
+        empty_cache,
+        grad_scaler,
+        is_cuda,
+        optimize_cuda,
+        resolve_device,
+    )
+except ImportError:  # script import (python backend/temporal_training.py)
+    from runtime import (  # type: ignore[no-redef]
+        autocast,
+        dataloader_kwargs,
+        empty_cache,
+        grad_scaler,
+        is_cuda,
+        optimize_cuda,
+        resolve_device,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -83,17 +104,12 @@ CHECKPOINT_PATH: str = "best_malpractice_model.pth"
 
 def get_device() -> torch.device:
     """
-    Auto-detect the fastest available compute device.
+    Return the explicit compute device.
 
-    Returns:
-        torch.device("cuda") if a GPU is present, else torch.device("mps")
-        on Apple Silicon, else torch.device("cpu").
+    CUDA is used when available; this is the literal expression the rest of
+    the pipeline standardises on, rather than relying on implicit placement.
     """
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return resolve_device("auto")
 
 
 def set_seed(seed: int = 0) -> None:
@@ -103,6 +119,7 @@ def set_seed(seed: int = 0) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    optimize_cuda(get_device())
 
 
 # ---------------------------------------------------------------------------
@@ -210,15 +227,19 @@ def make_dataloaders(
     y_val: np.ndarray,
     batch_size: int = 32,
     class_weighted: bool = True,
-    num_workers: int = 0,
+    num_workers: int | None = None,
     seed: int = 0,
+    device: Optional[torch.device] = None,
+    persistent_workers: bool | None = None,
+    prefetch_factor: int = 4,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.Tensor]]:
     """
     Build train/validation DataLoaders with class-imbalance handling.
 
     The train loader uses a ``WeightedRandomSampler`` weighted by inverse
     class frequency so rare malpractice behaviours are re-sampled every epoch.
-    Tensors are ``pin_memory``-pinned when running on CUDA.
+    Loader workers, pinned memory and prefetching are configured once by
+    :mod:`backend.runtime` so the GPU is not starved by host-side preparation.
 
     Args:
         X_train: (N_tr, T, F) feature tensor.
@@ -227,41 +248,52 @@ def make_dataloaders(
         y_val: (N_va,) integer labels.
         batch_size: samples per batch.
         class_weighted: enable WeightedRandomSampler + class weights.
-        num_workers: DataLoader worker processes.
+        num_workers: worker processes; ``None`` chooses a safe host default.
         seed: RNG seed for the sampler.
+        device: consumer device (pinned memory is enabled for CUDA only).
+        persistent_workers: keep workers alive between epochs.
+        prefetch_factor: batches each worker prepares ahead of time.
 
     Returns:
         (train_loader, val_loader, class_weights) where class_weights is a
         (C,) float32 tensor (or None when class_weighted=False).
     """
+    device = device or get_device()
+    optimize_cuda(device)
     train_ds = ExamDataset(X=X_train, y=y_train)
     val_ds = ExamDataset(X=X_val, y=y_val)
 
-    pin = torch.cuda.is_available()
+    loader_kwargs = dataloader_kwargs(
+        device,
+        num_workers,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
     weights_tensor: Optional[torch.Tensor] = None
     sampler = None
+    generator = torch.Generator().manual_seed(seed)
     if class_weighted:
         weights_tensor = _class_weight_tensor(y_train)
         sampler = torch.utils.data.WeightedRandomSampler(
             weights=weights_tensor[y_train],
             num_samples=len(y_train),
             replacement=True,
-            generator=torch.Generator().manual_seed(seed),
+            generator=generator,
         )
 
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin,
+        shuffle=False,
+        generator=generator,
+        **loader_kwargs,
     )
     val_loader = torch.utils.data.DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin,
+        **loader_kwargs,
     )
     return train_loader, val_loader, weights_tensor
 
@@ -570,11 +602,19 @@ class _MalpracticeRecurrent(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.rnn(x)  # (B, T, D)
+        # cuDNN's RNN path with recurrent dropout crashes at process teardown
+        # on this Windows + CUDA 13 build (0xC0000409).  Disable cuDNN only for
+        # this tiny recurrent call; native RNN kernels are still GPU-backed and
+        # the rest of the pipeline keeps cuDNN's conv fast path.
+        if x.is_cuda and torch.backends.cudnn.is_available():
+            with torch.backends.cudnn.flags(enabled=False):
+                out, _ = self.rnn(x)  # (B, T, D)
+        else:
+            out, _ = self.rnn(x)  # (B, T, D)
         if self.use_attention:
             context, _ = self.attention(out)  # (B, D)
         else:
-            context = out[:, -1, :]           # (B, D)
+            context = out[:, -1, :]           # (B, T, D) -> last step
         return self.head(context)
 
 
@@ -602,26 +642,54 @@ def _train_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    scaler: Optional[Any] = None,
+    grad_accum_steps: int = 1,
+    grad_clip: float = 5.0,
+    use_amp: bool = True,
 ) -> tuple[float, float]:
     """
     One full training pass over the train loader.
+
+    Uses FP16 autocast and a GradScaler on CUDA, accumulates gradients when
+    the batch is too large for 6 GB VRAM, and keeps loss/accuracy totals on
+    the GPU until the epoch ends to avoid a synchronization per batch.
 
     Returns:
         (mean_loss, accuracy) over the epoch.
     """
     model.train()
-    total_loss, correct, n = 0.0, 0, 0
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(x)                     # (B, C)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * x.size(0)
-        correct += int((logits.argmax(dim=1) == y).sum())
-        n += x.size(0)
-    return total_loss / max(n, 1), correct / max(n, 1)
+    scaler = scaler or grad_scaler(device, enabled=use_amp)
+    accum = max(1, int(grad_accum_steps))
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    correct = torch.zeros((), device=device, dtype=torch.int64)
+    n = 0
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (x, y) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=is_cuda(device))
+        y = y.to(device, non_blocking=is_cuda(device))
+        with autocast(device, enabled=use_amp):
+            logits = model(x)                     # (B, C)
+            loss = criterion(logits, y)
+
+        # Normalise so an accumulation window has the same effective LR as a
+        # single large batch.
+        scaler.scale(loss / accum).backward()
+
+        if step % accum == 0 or step == len(loader):
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        batch = x.size(0)
+        total_loss += loss.detach() * batch
+        correct += (logits.argmax(dim=1) == y).sum()
+        n += batch
+
+    return float(total_loss.item()) / max(n, 1), float(correct.item()) / max(n, 1)
 
 
 def _validate_epoch(
@@ -629,31 +697,39 @@ def _validate_epoch(
     loader: torch.utils.data.DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    use_amp: bool = True,
 ) -> tuple[float, float, np.ndarray, np.ndarray]:
     """
     One full evaluation pass over the validation loader.
+
+    Inference mode disables autograd bookkeeping entirely; autocast keeps the
+    FP16 speed-up without a GradScaler (no backward pass is performed).
 
     Returns:
         (mean_loss, accuracy, y_true, y_pred).
     """
     model.eval()
-    total_loss, correct, n = 0.0, 0, 0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    correct = torch.zeros((), device=device, dtype=torch.int64)
+    n = 0
     y_true: list[int] = []
     y_pred: list[int] = []
-    with torch.no_grad():
+    with torch.inference_mode(), autocast(device, enabled=use_amp):
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
+            x = x.to(device, non_blocking=is_cuda(device))
+            y = y.to(device, non_blocking=is_cuda(device))
             logits = model(x)
             loss = criterion(logits, y)
-            total_loss += loss.item() * x.size(0)
             preds = logits.argmax(dim=1)
-            correct += int((preds == y).sum())
-            n += x.size(0)
+            batch = x.size(0)
+            total_loss += loss.detach() * batch
+            correct += (preds == y).sum()
+            n += batch
             y_true.extend(y.cpu().tolist())
             y_pred.extend(preds.cpu().tolist())
     return (
-        total_loss / max(n, 1),
-        correct / max(n, 1),
+        float(total_loss.item()) / max(n, 1),
+        float(correct.item()) / max(n, 1),
         np.asarray(y_true, dtype=np.int64),
         np.asarray(y_pred, dtype=np.int64),
     )
@@ -732,6 +808,9 @@ def train_sequence_model(
     checkpoint_path: str | Path = CHECKPOINT_PATH,
     device: Optional[torch.device] = None,
     seed: int = 0,
+    amp: bool = True,
+    grad_accum_steps: int = 1,
+    grad_clip: float = 5.0,
 ) -> tuple[dict, float]:
     """
     Train a deep sequence classifier with the full Week 5 pipeline.
@@ -758,12 +837,17 @@ def train_sequence_model(
         checkpoint_path: where the best model checkpoint is written.
         device: compute device (auto-detected when None).
         seed: RNG seed for reproducible training.
+        amp: enable FP16 autocast + GradScaler on CUDA.
+        grad_accum_steps: micro-batches per optimizer step (raise instead of
+            raising batch size when VRAM is tight).
+        grad_clip: gradient-norm clip; 0 disables clipping.
 
     Returns:
         (history, best_val_f1) where history holds per-epoch train/val loss,
         accuracy and macro-F1.
     """
     device = device or get_device()
+    optimize_cuda(device)
     set_seed(seed)
     model.to(device)
 
@@ -776,6 +860,7 @@ def train_sequence_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=lr_factor, patience=lr_patience
     )
+    scaler = grad_scaler(device, enabled=amp)
 
     history: dict[str, list[float]] = {
         "train_loss": [],
@@ -792,12 +877,25 @@ def train_sequence_model(
     stop_epoch: Optional[int] = None
 
     for epoch in range(1, epochs + 1):
-        train_loss, train_acc = _train_epoch(
-            model, train_loader, criterion, optimizer, device
-        )
-        val_loss, val_acc, y_true, y_pred = _validate_epoch(
-            model, val_loader, criterion, device
-        )
+        try:
+            train_loss, train_acc = _train_epoch(
+                model, train_loader, criterion, optimizer, device,
+                scaler=scaler,
+                grad_accum_steps=grad_accum_steps,
+                grad_clip=grad_clip,
+                use_amp=amp,
+            )
+            val_loss, val_acc, y_true, y_pred = _validate_epoch(
+                model, val_loader, criterion, device, use_amp=amp
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            empty_cache(device)
+            raise RuntimeError(
+                "CUDA out of memory while training the sequence model. "
+                f"Current batch_size={getattr(train_loader, 'batch_size', '?')}. "
+                "Halve batch_size, raise grad_accum_steps to keep the effective "
+                "batch, or lower the image/sequence resolution."
+            ) from exc
         from sklearn.metrics import f1_score
 
         val_f1 = float(
@@ -869,9 +967,10 @@ def evaluate_sequence_model(
         metrics dict (accuracy, macro_f1, per_class, confusion_matrix, ...).
     """
     device = device or get_device()
+    optimize_cuda(device)
     model.to(device)
     _, _, y_true, y_pred = _validate_epoch(
-        model, loader, nn.CrossEntropyLoss(), device
+        model, loader, nn.CrossEntropyLoss(), device, use_amp=True
     )
     return evaluate_classifier(y_true, y_pred, class_names=class_names)
 

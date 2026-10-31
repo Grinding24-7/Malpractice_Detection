@@ -38,6 +38,11 @@ if str(_ROOT) not in sys.path:
 
 from desktop_app.core import perf_config  # noqa: E402
 from desktop_app.core.object_context import ObjectContext  # noqa: E402
+from backend.runtime import (  # noqa: E402
+    optimize_cuda,
+    resolve_device,
+    yolo_device,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,9 @@ class PoseDetector:
 
     model: Any = None
     obj_model: Any = None  # YOLO11n for object detection
+    _device: Any = field(default=None, repr=False)
+    _device_arg: str = "cpu"
+    _half: bool = False
     _frame_counter: int = 0
     subsample_rate: int = 6  # process every 6th frame (30 / 5)
 
@@ -145,12 +153,30 @@ class PoseDetector:
         # --- YOLO11n-pose (person detection + keypoints) ---
         try:
             from ultralytics import YOLO
+            self._device = resolve_device(perf_config.INFERENCE_DEVICE)
+            self._device_arg = yolo_device(self._device)
+            self._half = (
+                bool(perf_config.INFERENCE_HALF)
+                and self._device.type == "cuda"
+            )
+            optimize_cuda(self._device)
             model_path = Path(__file__).resolve().parent / "yolo11n-pose.pt"
             # Prefer a checked-out copy next to this module; fall back to the
             # bare asset name so a fresh clone still triggers the download.
             self.model = YOLO(str(model_path if model_path.exists() else "yolo11n-pose.pt"))
-            _ = self.model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
-            logger.info("YOLO11n-pose loaded from %s", model_path)
+            _ = self.model(
+                np.zeros((640, 640, 3), dtype=np.uint8),
+                imgsz=perf_config.POSE_IMGSZ,
+                device=self._device_arg,
+                quantize=16 if self._half else None,
+                verbose=False,
+            )
+            logger.info(
+                "YOLO11n-pose loaded from %s (%s%s)",
+                model_path,
+                self._device.type,
+                ", FP16" if self._half else "",
+            )
         except ImportError:
             raise RuntimeError("ultralytics not installed. Run: uv pip install ultralytics")
 
@@ -196,13 +222,20 @@ class PoseDetector:
         except Exception as exc:
             logger.warning("Failed to load SkeletonBuffer: %s", exc)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _infer(self, frame: np.ndarray) -> InferenceResult:
-        """Run YOLO11n-pose in ByteTrack tracking mode.  Decorated with
-        @torch.no_grad to prevent autograd graph accumulation (memory leak
-        prevention).  `persist=True` keeps candidate_ids stable across frames."""
+        """Run YOLO11n-pose in ByteTrack tracking mode.  Inference mode
+        prevents autograd graph accumulation (memory leak prevention).
+        `persist=True` keeps candidate_ids stable across frames."""
         results = self.model.track(
-            frame, persist=True, tracker="bytetrack.yaml", verbose=False
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            imgsz=perf_config.POSE_IMGSZ,
+            max_det=perf_config.POSE_MAX_DET,
+            device=self._device_arg,
+            quantize=16 if self._half else None,
+            verbose=False,
         )
         r = results[0]
 

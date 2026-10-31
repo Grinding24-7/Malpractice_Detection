@@ -27,6 +27,19 @@ from __future__ import annotations
 import os
 
 # ---------------------------------------------------------------------------
+# Compute device / inference precision
+# ---------------------------------------------------------------------------
+# "auto" resolves to CUDA when torch.cuda.is_available(); setting
+# IP_TORCH_DEVICE=cpu is the supported way to force the CPU path.
+INFERENCE_DEVICE: str = os.environ.get("IP_TORCH_DEVICE", "auto")
+
+# FP16 inference halves activation memory and uses the GPU tensor cores.
+# It is ignored on CPU by the workers (Ultralytics supports FP16 on CUDA only).
+INFERENCE_HALF: bool = os.environ.get(
+    "IP_INFERENCE_HALF", "1"
+) not in ("0", "false", "False")
+
+# ---------------------------------------------------------------------------
 # YOLO pose detection
 # ---------------------------------------------------------------------------
 
@@ -338,6 +351,35 @@ MP_MODEL_VARIANT: str = os.environ.get("IP_MP_MODEL", "full")
 MP_NUM_POSES: int = int(os.environ.get("IP_MP_NUM_POSES", "1"))
 
 # ---------------------------------------------------------------------------
+# Head occupancy (SCUT-HEAD)
+# ---------------------------------------------------------------------------
+# SCUT-HEAD labels heads, not poses or behaviour.  A dedicated one-class head
+# detector is therefore the honest way to use it: occupancy/counting on real
+# classroom frames, with no claim about P01-P38 behaviour.
+HEAD_MODEL_FILE: str = os.environ.get(
+    "IP_HEAD_MODEL", "scut_head_yolo11n.pt"
+)
+HEAD_MODEL_DIRS: tuple[str, ...] = (
+    os.environ.get("IP_HEAD_MODEL_DIR", "models/head"),
+    "models/head",
+    "models",
+    "backend",
+)
+HEAD_IMGSZ: int = int(os.environ.get("IP_HEAD_IMGSZ", "640"))
+HEAD_CONF: float = float(os.environ.get("IP_HEAD_CONF", "0.25"))
+HEAD_NMS_IOU: float = float(os.environ.get("IP_HEAD_NMS_IOU", "0.45"))
+HEAD_MAX_DET: int = int(os.environ.get("IP_HEAD_MAX_DET", "300"))
+HEAD_TARGET_FPS: float = float(os.environ.get("IP_HEAD_FPS", "5.0"))
+HEAD_DEVICE: str = os.environ.get("IP_HEAD_DEVICE", INFERENCE_DEVICE)
+HEAD_HALF: bool = os.environ.get(
+    "IP_HEAD_HALF", "1" if INFERENCE_HALF else "0"
+) not in ("0", "false", "False")
+
+# Image-folder / image-list replay rate (the PyQt6 app loops SCUT-HEAD images
+# at this speed; inference still runs at its own rate).
+REPLAY_FPS: float = float(os.environ.get("IP_REPLAY_FPS", "2.0"))
+
+# ---------------------------------------------------------------------------
 # Inference scheduling
 # ---------------------------------------------------------------------------
 
@@ -510,6 +552,7 @@ def describe() -> str:
         f"@{OBJ_SPATIAL_MIN_CONFIDENCE} "
         f"escalations={len(OBJ_ESCALATE_TO)} "
         f"obj_model={OBJ_CUSTOM_MODEL_FILE}->{OBJ_FALLBACK_MODEL_FILE} "
+        f"device={INFERENCE_DEVICE} half={INFERENCE_HALF} "
         f"mp={MP_MODEL_VARIANT} target_fps={TARGET_INFERENCE_FPS} "
         f"warn_ms={WARN_THRESHOLD_MS} warmup={WARMUP_FRAMES} "
         f"streak={ANOMALY_MIN_STREAK_FRAMES} margin={ANOMALY_MIN_MARGIN} "

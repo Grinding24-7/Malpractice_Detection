@@ -12,6 +12,7 @@ Source types:
     - USB webcam (integer device index, auto-scan 0-3)
     - RTSP/RTMP network stream (string URL, with auto-reconnection)
     - Video file (string path)
+    - Image folder or image-list file (.txt/.csv) for dataset replay
     - Synthetic mock frames (fallback)
 
 Priority on Windows: cv2.CAP_DSHOW for device indices.
@@ -22,6 +23,7 @@ Never throws to the GUI; all errors are logged and recovered from.
 from __future__ import annotations
 
 import collections
+import csv
 import logging
 import sys
 import threading
@@ -41,6 +43,8 @@ _ASSETS_DIR = _PROJECT_ROOT / "assets"
 _BACKEND_DIR = _PROJECT_ROOT / "backend"
 
 _MOCK_W, _MOCK_H = 640, 480
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_LIST_EXTS = {".txt", ".csv"}
 
 # RTSP reconnection constants
 RTSP_MAX_RECONNECT_ATTEMPTS = 10
@@ -117,11 +121,18 @@ class CameraThread(QThread):
         self._is_network_stream = isinstance(source, str) and (
             source.startswith("rtsp://") or source.startswith("rtmp://")
         )
+        self._is_image_source = self._looks_like_image_source(source)
+        self._image_paths: list[Path] = []
+        self._image_index = 0
+        self._image_cursor = 0
+        self._image_interval = 1.0 / max(perf_config.REPLAY_FPS, 0.1)
         self._actual_fps: float = 30.0
 
         # Thread-safe single-frame lossy buffer (InferenceThread reads this)
         self._buffer_lock = threading.Lock()
         self._frame_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=1)
+        self._frame_buffer_index: int = 0
+        self._frame_buffer_path: str = ""
 
         # Dead-source watchdog state.
         self._dark_streak: int = 0
@@ -136,6 +147,16 @@ class CameraThread(QThread):
         # status line or the console.
         self._last_fault_notice: float = 0.0
         self._suppressed_fault_notices: int = 0
+
+    @staticmethod
+    def _looks_like_image_source(source: str | int) -> bool:
+        """True for a directory of images or a .txt/.csv image list."""
+        if not isinstance(source, str) or not source.strip():
+            return False
+        path = Path(source)
+        if path.is_dir():
+            return True
+        return path.suffix.lower() in IMAGE_LIST_EXTS
 
     # ------------------------------------------------------------------
     # Static device probing (called from Hub dropdown population)
@@ -198,6 +219,21 @@ class CameraThread(QThread):
         """Actual FPS reported by the capture device."""
         return self._actual_fps
 
+    @property
+    def image_count(self) -> int:
+        """Number of images in the current replay source (0 for live video)."""
+        return len(self._image_paths)
+
+    @property
+    def image_index(self) -> int:
+        """Index of the most recently emitted replay image (1-based-ish)."""
+        return self._image_index
+
+    @property
+    def is_image_replay(self) -> bool:
+        """True when the source is an image folder/list rather than video."""
+        return bool(self._image_paths)
+
     def get_latest_frame(self) -> np.ndarray | None:
         """Non-blocking read from the lossy RAM buffer.
 
@@ -208,6 +244,19 @@ class CameraThread(QThread):
             if self._frame_buffer:
                 return self._frame_buffer[-1]
             return None
+
+    def get_latest_frame_with_meta(
+        self,
+    ) -> tuple[np.ndarray | None, int, str]:
+        """Return frame, replay index, and replay image path atomically."""
+        with self._buffer_lock:
+            if self._frame_buffer:
+                return (
+                    self._frame_buffer[-1],
+                    self._frame_buffer_index,
+                    self._frame_buffer_path,
+                )
+            return None, self._frame_buffer_index, self._frame_buffer_path
 
     def stop(self) -> None:
         """Gracefully stop the capture loop and release hardware."""
@@ -234,6 +283,22 @@ class CameraThread(QThread):
 
         while self._running:
             try:
+                if self._image_paths:
+                    frame = self._next_image()
+                    if frame is None:
+                        self.status_update.emit(
+                            "Image replay source has no readable images — "
+                            "switching to mock feed"
+                        )
+                        self._mock_mode = True
+                        self._image_paths = []
+                        continue
+                    self._emit_frame(frame)
+                    # Dataset replay is deliberately slower than inference:
+                    # it is a frame-by-frame inspection source, not video.
+                    time.sleep(self._image_interval)
+                    continue
+
                 if self._mock_mode:
                     frame = self._mock_frame()
                 else:
@@ -269,7 +334,131 @@ class CameraThread(QThread):
         """Store frame in lossy buffer and emit signal for UI rendering."""
         with self._buffer_lock:
             self._frame_buffer.append(frame)
+            self._frame_buffer_index = self._image_index
+            if self._image_paths and 0 <= self._image_index < len(self._image_paths):
+                self._frame_buffer_path = str(self._image_paths[self._image_index])
+            else:
+                self._frame_buffer_path = ""
         self.raw_frame.emit(frame)
+
+    # ------------------------------------------------------------------
+    # Image folder / image-list replay
+    # ------------------------------------------------------------------
+
+    def _next_image(self) -> np.ndarray | None:
+        """Return the next readable replay image, looping at the end."""
+        total = len(self._image_paths)
+        if total == 0:
+            return None
+        for _ in range(total):
+            index = self._image_cursor % total
+            self._image_cursor = (index + 1) % total
+            frame = cv2.imread(str(self._image_paths[index]))
+            if frame is not None:
+                self._image_index = index
+                return frame
+        return None
+
+    def _open_image_source(self) -> bool:
+        """Load a directory or .txt/.csv image list as a replay source."""
+        source = Path(str(self._source))
+        paths = self._collect_image_paths(source)
+        if not paths:
+            self.status_update.emit(
+                f"No readable images found in {_describe_source(self._source)}"
+            )
+            return False
+        self._image_paths = paths
+        self._image_cursor = 0
+        self._image_index = 0
+        self._actual_fps = max(perf_config.REPLAY_FPS, 0.1)
+        self.status_update.emit(
+            f"Image replay: {len(paths):,} images from "
+            f"{_describe_source(self._source)} "
+            f"({self._actual_fps:g} fps, looping)"
+        )
+        return True
+
+    def _collect_image_paths(self, source: Path) -> list[Path]:
+        """Resolve a directory, text list or CSV manifest to image files."""
+        candidates: list[Path] = []
+        if source.is_dir():
+            direct = sorted(
+                p for p in source.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+            )
+            # A parent folder such as datasets/SCUT_HEAD has no images at the
+            # top level; fall back to a recursive scan in that case.
+            candidates = direct or sorted(
+                p for p in source.rglob("*")
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+            )
+        elif source.suffix.lower() == ".csv":
+            candidates = self._read_csv_list(source)
+        elif source.suffix.lower() == ".txt":
+            candidates = self._read_text_list(source)
+
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            key = str(resolved).lower()
+            if key in seen or not resolved.is_file():
+                continue
+            if resolved.suffix.lower() not in IMAGE_EXTS:
+                continue
+            seen.add(key)
+            unique.append(resolved)
+        return unique
+
+    @staticmethod
+    def _resolve_listed_path(value: str, list_path: Path) -> Path:
+        raw = Path(value.strip().strip('"').strip("'"))
+        if raw.is_absolute():
+            return raw
+        for base in (list_path.parent, _PROJECT_ROOT):
+            candidate = base / raw
+            if candidate.is_file():
+                return candidate
+        return _PROJECT_ROOT / raw
+
+    def _read_text_list(self, list_path: Path) -> list[Path]:
+        paths: list[Path] = []
+        for line in list_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            # Tolerate "path,label" rows in hand-written lists.
+            if "," in value:
+                candidate = value.split(",", 1)[0].strip().strip('"').strip("'")
+                if Path(candidate).suffix.lower() in IMAGE_EXTS:
+                    value = candidate
+            paths.append(self._resolve_listed_path(value, list_path))
+        return paths
+
+    def _read_csv_list(self, list_path: Path) -> list[Path]:
+        paths: list[Path] = []
+        with open(list_path, newline="", encoding="utf-8", errors="replace") as handle:
+            reader = csv.DictReader(handle)
+            field = ""
+            for name in ("image", "path", "file", "filename"):
+                if reader.fieldnames and name in reader.fieldnames:
+                    field = name
+                    break
+            if not field and reader.fieldnames:
+                field = reader.fieldnames[0]
+            if not field:
+                return paths
+            for row in reader:
+                value = str(row.get(field, "") or "").strip()
+                if value:
+                    paths.append(self._resolve_listed_path(value, list_path))
+        return paths
 
     # ------------------------------------------------------------------
     # Dead-source watchdog
@@ -399,6 +588,18 @@ class CameraThread(QThread):
 
     def _open_source(self) -> None:
         """Open the specified source, falling back through the chain."""
+        # ── Image folder / image list (dataset replay) ────────────────────
+        # This is an explicit source: never silently fall through to a webcam
+        # when the user asked to inspect a dataset folder.
+        if self._is_image_source:
+            if self._open_image_source():
+                return
+            self.status_update.emit(
+                "Image replay source could not be opened — using mock feed"
+            )
+            self._mock_mode = True
+            return
+
         # ── Explicit video file path ─────────────────────────────────────
         # Checked before the webcam scan.  When a caller names a file, that
         # file is what was asked for: the previous order scanned webcams

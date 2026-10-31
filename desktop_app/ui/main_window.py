@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 
 from desktop_app.core.camera_thread import CameraThread
+from desktop_app.core.head_detector import HeadCountWorker, resolve_head_model
 from desktop_app.core.inference_worker import InferenceWorker
 from desktop_app.ui.hub_widget import HubWidget
 from desktop_app.ui.video_widget import VideoWidget
@@ -58,7 +59,7 @@ class MainWindow(QMainWindow):
 
         # Thread references (created on launch)
         self._camera: CameraThread | None = None
-        self._worker: InferenceWorker | None = None
+        self._worker: InferenceWorker | HeadCountWorker | None = None
         self._threads_running = False
 
         self._candidate_name = ""
@@ -160,44 +161,73 @@ class MainWindow(QMainWindow):
         # Stop hub camera if running
         self.hub.cleanup()
 
-        # Create fresh camera thread.  The hub resolves the source: an RTSP
-        # URL when one is entered, otherwise the selected webcam index.
+        # Create fresh camera thread.  The hub resolves the source: an image
+        # replay list/folder, an RTSP URL, or the selected webcam index.
         source = self.hub._get_camera_source()
         self._camera = CameraThread(source=source)
 
-        # Create inference worker (depends on camera)
-        self._worker = InferenceWorker(camera=self._camera)
+        # Analysis mode: head occupancy (SCUT-HEAD labels) or pose rules.
+        # A head-mode launch without weights falls back to pose rather than
+        # showing an empty "0 heads" screen for a model that never loaded.
+        mode = self.hub.detection_mode()
+        self._worker = None
+        if mode == "head":
+            head_path = resolve_head_model()
+            if head_path is None:
+                logger.warning(
+                    "Head mode selected but no head weights found; "
+                    "falling back to P01-P38 pose rules"
+                )
+            else:
+                logger.info("Head occupancy mode using %s", head_path)
+                self._worker = HeadCountWorker(
+                    camera=self._camera, model_path=head_path
+                )
+        if self._worker is None:
+            self._worker = InferenceWorker(camera=self._camera)
 
         # ── Signal wiring ────────────────────────────────────────────────
-        # Camera → UI (60 FPS raw rendering via raw_frame)
-        self._camera.raw_frame.connect(self.video_widget.set_frame)
-        # Camera → inference FPS counter
+        # Camera → FPS counter for both modes.  Pose mode also shows raw
+        # frames for smoothness; head mode waits for processed HUD frames so
+        # dataset replay does not flicker between raw and annotated images.
         self._camera.raw_frame.connect(lambda _: self._worker.tick_capture_fps())
+        if not isinstance(self._worker, HeadCountWorker):
+            self._camera.raw_frame.connect(self.video_widget.set_frame)
+        else:
+            self.video_widget.setText("Loading head detector...")
         # Camera status
         self._camera.status_update.connect(
             lambda msg: logger.info("[Camera] %s", msg)
         )
 
-        # Inference → UI
+        # Inference → UI.  update_result dispatches head counts vs pose rules.
         self._worker.frame_processed.connect(self.video_widget.set_frame)
-        self._worker.result_ready.connect(self.sidebar.update_pose)
-        self._worker.result_ready.connect(self.sidebar.update_anomaly_ticker)
+        self._worker.result_ready.connect(self.sidebar.update_result)
         self._worker.fps_updated.connect(self.sidebar.update_inference_fps)
         self._worker.capture_fps_updated.connect(self.sidebar.update_capture_fps)
 
         # Sidebar session info
         self.sidebar.set_session_info(candidate_name, exam_code)
 
-        # ── Recording toggle wiring ──────────────────────────────────────
-        self.hub.recording_toggled.connect(self._worker.set_recording)
-
-        # ── Head state change logging ────────────────────────────────────
-        self._worker.head_state_changed.connect(self._on_head_state_changed)
-
-        # ── Neutral posture state logging ────────────────────────────────
-        # Emitted only on transition, so the console gets one line per
-        # neutral state change rather than one per frame.
-        self._worker.neutral_state_changed.connect(self._on_neutral_state_changed)
+        # ── Mode-specific wiring ─────────────────────────────────────────
+        try:
+            self.hub.recording_toggled.disconnect()
+        except TypeError:
+            pass
+        if isinstance(self._worker, HeadCountWorker):
+            self._worker.status_update.connect(
+                lambda msg: logger.info("[Head] %s", msg)
+            )
+            self.hub.record_checkbox.setChecked(False)
+            self.hub.record_checkbox.setEnabled(False)
+            self.sidebar.ticker.clear()
+            self.setWindowTitle("Exam Monitoring — Head Occupancy (SCUT-HEAD)")
+        else:
+            self.hub.recording_toggled.connect(self._worker.set_recording)
+            self._worker.head_state_changed.connect(self._on_head_state_changed)
+            self._worker.neutral_state_changed.connect(self._on_neutral_state_changed)
+            self.hub.record_checkbox.setEnabled(True)
+            self.setWindowTitle("Exam Malpractice Detection — P01-P40 HUD")
 
         # ── Start threads ────────────────────────────────────────────────
         self._camera.start()

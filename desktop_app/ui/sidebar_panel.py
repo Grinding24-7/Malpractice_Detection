@@ -41,6 +41,18 @@ class SidebarPanel(QWidget):
 
         layout.addSpacing(4)
 
+        # ── Occupancy section (SCUT-HEAD head mode) ───────────────────────
+        layout.addWidget(self._section("Occupancy (SCUT-HEAD)"))
+        self.occupancy_label = self._value("--", size=20, bold=True)
+        self.occupancy_detail_label = self._value(
+            "Pose mode", size=12, color="#adb5bd"
+        )
+        self.occupancy_detail_label.setWordWrap(True)
+        layout.addWidget(self.occupancy_label)
+        layout.addWidget(self.occupancy_detail_label)
+
+        layout.addSpacing(8)
+
         # ── Active Pose section ──────────────────────────────────────────
         layout.addWidget(self._section("Active Pose"))
         self.pose_id_label = self._value("--", size=20, bold=True)
@@ -108,7 +120,81 @@ class SidebarPanel(QWidget):
     def set_session_info(self, candidate_name: str, exam_code: str) -> None:
         self.session_label.setText(f"{candidate_name}  |  {exam_code}")
 
+    def update_result(self, result: dict) -> None:
+        """Dispatch a classifier or head-occupancy result to the right view."""
+        if result.get("mode") == "head":
+            self.update_occupancy(result)
+        else:
+            self.update_pose(result)
+            self.update_anomaly_ticker(result)
+
+    def update_occupancy(self, result: dict) -> None:
+        """Show SCUT-HEAD head counts without pretending they are behaviour."""
+        count = int(result.get("head_count", 0) or 0)
+        gt_count = result.get("ground_truth_count")
+        error = str(result.get("error") or "")
+        dead = bool(result.get("source_dead"))
+        if dead:
+            colour, text = "#ff6b6b", "NO SIGNAL"
+        elif error:
+            colour, text = "#ff6b6b", "ERROR"
+        else:
+            colour, text = "#51cf66", f"Heads: {count}"
+        self.occupancy_label.setText(text)
+        self.occupancy_label.setStyleSheet(
+            f"color: {colour}; font-size: 20px; font-weight: bold; "
+            "font-family: Consolas, monospace;"
+        )
+
+        if error:
+            detail = error
+        elif dead:
+            detail = "Occupancy unknown"
+        else:
+            parts = []
+            if gt_count is not None:
+                parts.append(f"GT: {int(gt_count)} heads")
+            if result.get("image_count"):
+                parts.append(
+                    f"Image {int(result.get('image_index', 0)) + 1}/"
+                    f"{int(result.get('image_count', 0))}"
+                )
+            if not parts:
+                parts.append("Head boxes only — no behaviour labels")
+            detail = "  |  ".join(parts)
+        self.occupancy_detail_label.setText(detail)
+        self.occupancy_detail_label.setStyleSheet(
+            "color: #ff6b6b; font-size: 12px;"
+            if error or dead else
+            "color: #adb5bd; font-size: 12px;"
+        )
+
+        self.pose_id_label.setText("Pose: --")
+        self.pose_id_label.setStyleSheet(
+            "color: #868e96; font-size: 20px; font-weight: bold; "
+            "font-family: monospace;"
+        )
+        self.pose_name_label.setText("Head occupancy mode")
+        self.confidence_label.setText(
+            f"Mean head conf: {float(result.get('confidence', 0.0)):.0%}"
+            if count else "No heads detected"
+        )
+        for label in (self.yaw_label, self.pitch_label, self.roll_label):
+            label.setText(label.text().split(":")[0] + ": --")
+        self.gaze_label.setText("Gaze: --")
+        self.yaw_var_label.setText("Yaw Var: --")
+        self.sustained_label.setText("Sustained: --")
+
     def update_pose(self, result: dict) -> None:
+        self.occupancy_label.setText("--")
+        self.occupancy_label.setStyleSheet(
+            "color: #868e96; font-size: 20px; font-weight: bold; "
+            "font-family: Consolas, monospace;"
+        )
+        self.occupancy_detail_label.setText("Pose mode")
+        self.occupancy_detail_label.setStyleSheet(
+            "color: #adb5bd; font-size: 12px;"
+        )
         pose_id = result.get("pose_id", "P01")
         # System states (camera fault / startup) and neutral posture states
         # are not anomalies; neutral states get their own green treatment so

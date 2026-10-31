@@ -26,6 +26,8 @@ backend/exports/
 # Generated pose datasets (collected via /api/record_label or build_cctv_dataset.py)
 backend/pose_dataset.csv
 backend/pose_dataset_cctv.csv
+# Parsed feature-matrix caches (rebuilt automatically from the CSV)
+*.feature_cache.npz
 
 # Downloaded public datasets
 datasets/
@@ -35,6 +37,9 @@ datasets/
 backend/*.mp4
 *.pt
 *.task
+
+# Local SCUT-HEAD training runs (weights, logs, summaries)
+models/head/
 
 # IDE / OS
 .idea/

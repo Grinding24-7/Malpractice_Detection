@@ -39,6 +39,21 @@ from desktop_app.core.dataset_logger import DatasetLogger
 from desktop_app.core.object_context import MP_LEFT_WRIST, MP_RIGHT_WRIST
 from desktop_app.core import perf_config
 
+try:
+    from backend.runtime import (
+        empty_cache,
+        optimize_cuda,
+        resolve_device,
+        yolo_device,
+    )
+except ImportError:  # pragma: no cover - direct module execution
+    from runtime import (  # type: ignore[no-redef]
+        empty_cache,
+        optimize_cuda,
+        resolve_device,
+        yolo_device,
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +92,9 @@ class DeskProximityThread(QThread):
         }
         self._model: Any = None
         self._class_map: dict[int, str] = {}
+        self._device = resolve_device(perf_config.INFERENCE_DEVICE)
+        self._device_arg = yolo_device(self._device)
+        self._half = bool(perf_config.INFERENCE_HALF) and self._device.type == "cuda"
         self._frame_count = 0
         # Detections persist between passes so the throttle costs latency,
         # not recall; aged out after a few passes without a sighting.
@@ -114,6 +132,8 @@ class DeskProximityThread(QThread):
     def stop(self) -> None:
         self._running = False
         self.wait(5000)
+        self._model = None
+        empty_cache(self._device)
 
     def _load_model(self) -> None:
         # Import here: object_context pulls in perf_config and numpy only,
@@ -141,9 +161,16 @@ class DeskProximityThread(QThread):
             return
         path, is_custom = resolved
         try:
+            optimize_cuda(self._device)
             self._model = YOLO(str(path))
             warm = np.zeros((640, 640, 3), dtype=np.uint8)
-            _ = self._model(warm, verbose=False)
+            _ = self._model(
+                warm,
+                imgsz=perf_config.OBJ_IMGSZ,
+                device=self._device_arg,
+                quantize=16 if self._half else None,
+                verbose=False,
+            )
         except Exception as exc:
             logger.warning("Proximity thread: failed to load %s: %s", path, exc)
             self._model = None
@@ -224,6 +251,8 @@ class DeskProximityThread(QThread):
                 crop,
                 imgsz=perf_config.OBJ_IMGSZ,
                 conf=perf_config.PROX_OBJ_CONF,
+                device=self._device_arg,
+                quantize=16 if self._half else None,
                 verbose=False,
             )
             r = results[0]
@@ -390,6 +419,9 @@ class InferenceWorker(QThread):
         if self._proximity is not None:
             self._proximity.stop()
             self._proximity = None
+        if self._classifier is not None:
+            self._classifier.release()
+            self._classifier = None
         if self._dataset_logger is not None:
             self._dataset_logger.close()
 

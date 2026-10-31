@@ -48,6 +48,7 @@ from temporal_training import (
     train_baseline,
     train_sequence_model,
 )
+from runtime import autocast, dataloader_kwargs
 
 logger = logging.getLogger("ablation")
 
@@ -251,12 +252,14 @@ def _run_single_ablation(
                 torch.from_numpy(y_test).long(),
             ),
             batch_size=64, shuffle=False,
+            **dataloader_kwargs(device),
         )
         model.eval()
         y_true_all, y_pred_all = [], []
-        with torch.no_grad():
+        with torch.inference_mode(), autocast(device):
             for xb, yb in test_loader:
-                preds = model(xb.to(device)).argmax(dim=1).cpu().tolist()
+                xb = xb.to(device, non_blocking=device.type == "cuda")
+                preds = model(xb).argmax(dim=1).cpu().tolist()
                 y_pred_all.extend(preds)
                 y_true_all.extend(yb.tolist())
         y_true_np = np.asarray(y_true_all, dtype=np.int64)
