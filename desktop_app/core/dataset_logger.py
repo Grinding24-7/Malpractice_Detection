@@ -1,75 +1,97 @@
-"""
-dataset_logger.py — Automated feature logging utility for ML re-training.
+"""Automated feature logging for ML re-training.
 
-Saves keypoint vectors, head pose angles, geometric features, and
-motion deltas into a structured CSV dataset for training P01-P40
-supervised classifiers.
+Writes the canonical 54-dimensional vector defined by
+``desktop_app.core.feature_schema`` plus metadata and source provenance.
+
+Key changes from the previous logger:
+
+* keypoints are normalised to the candidate bounding box, so a model trained
+  on one camera resolution transfers to another;
+* missing measurements are written as empty cells (``NaN`` on read), not
+  ``0.0``;
+* the four spatial features and ``motion_delta`` complete the 54-D contract;
+* every row records where it came from (``live``, ``kaggle_exam``, ...).
 
 Usage:
     logger = DatasetLogger()
+    logger.start_recording()
     logger.log_frame(result, motion_delta=0.5)
     logger.close()
-
-CSV schema:
-    timestamp, pose_id, confidence,
-    kpt_x0..kpt_x16, kpt_y0..kpt_y16,
-    yaw, pitch, roll,
-    elbow_flexion_left, elbow_flexion_right, neck_tilt_angle,
-    wrist_to_eye_ratio, wrist_to_ear_ratio, eye_to_shoulder_ratio,
-    hand_mouth_distance, shoulder_hip_offset_ratio, torso_leg_ratio,
-    shoulder_width_ratio, hip_width_ratio, torso_asymmetry,
-    motion_delta
 """
 
 from __future__ import annotations
 
 import csv
 import logging
-import time
+import math
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from desktop_app.core.feature_schema import (
+    CSV_COLUMNS,
+    FEATURE_NAMES,
+    feature_dict_from_components,
+)
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_CSV_PATH = _PROJECT_ROOT / "data" / "proctoring_features.csv"
 
-# Column order for the CSV
-_CSV_COLUMNS: list[str] = [
-    "timestamp",
-    "pose_id",
-    "confidence",
-    # 17 COCO keypoints (x and y)
-    *[f"kpt_x{i}" for i in range(17)],
-    *[f"kpt_y{i}" for i in range(17)],
-    # Head pose
-    "yaw",
-    "pitch",
-    "roll",
-    # Geometric features
-    "elbow_flexion_left",
-    "elbow_flexion_right",
-    "neck_tilt_angle",
-    "wrist_to_eye_ratio",
-    "wrist_to_ear_ratio",
-    "eye_to_shoulder_ratio",
-    "hand_mouth_distance",
-    "shoulder_hip_offset_ratio",
-    "torso_leg_ratio",
-    "shoulder_width_ratio",
-    "hip_width_ratio",
-    "torso_asymmetry",
-    # Motion
-    "motion_delta",
-]
+# Kept as a module-level alias for callers/tests that imported the old name.
+_CSV_COLUMNS: list[str] = list(CSV_COLUMNS)
+
+
+def _first(value: Any) -> Any:
+    """Return the first row of a list/array of candidates, or the value."""
+    if value is None:
+        return None
+    if hasattr(value, "ndim"):
+        if value.ndim == 0:
+            return value
+        return value[0]
+    if isinstance(value, (list, tuple)) and value:
+        return value[0]
+    return value
+
+
+def _first_keypoints(value: Any) -> Any:
+    """Extract one (17, 2/3) keypoint array from a result payload."""
+    if value is None:
+        return None
+    # (N, 17, 3) / (N, 17, 2) -> first candidate
+    if hasattr(value, "ndim") and value.ndim >= 3:
+        return value[0]
+    if isinstance(value, (list, tuple)) and value:
+        first = value[0]
+        if hasattr(first, "ndim"):
+            return first
+        # A flat list of 17 points is also valid.
+        if isinstance(first, (list, tuple)) and first:
+            if isinstance(first[0], (list, tuple)):
+                return first
+            return value
+    return value
+
+
+def _csv_number(value: Any) -> str | float:
+    """Render NaN as an empty CSV cell; keep finite numbers as floats."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(number):
+        return ""
+    return round(number, 6)
 
 
 class DatasetLogger:
-    """Logs per-frame feature vectors to CSV for ML re-training.
+    """Thread-safe per-frame feature logger.
 
-    Thread-safe: uses a lock around file writes so the inference thread
-    and UI thread can both call ``log_frame()`` without races.
+    The file handle, writer, recording flag and counter are shared between
+    the inference thread and the UI thread, so every mutation is locked.
     """
 
     def __init__(self, csv_path: Path | str | None = None) -> None:
@@ -79,8 +101,8 @@ class DatasetLogger:
         self._writer = csv.DictWriter(self._file, fieldnames=_CSV_COLUMNS)
         self._recording = False
         self._sample_count = 0
+        self._lock = threading.Lock()
 
-        # Write header if file is empty
         if self._csv_path.stat().st_size == 0:
             self._writer.writeheader()
             self._file.flush()
@@ -90,24 +112,29 @@ class DatasetLogger:
     # ------------------------------------------------------------------
 
     def start_recording(self) -> None:
-        """Enable feature logging."""
-        self._recording = True
-        logger.info("Dataset recording started")
+        with self._lock:
+            self._recording = True
+        logger.info("Dataset recording started -> %s", self._csv_path)
 
     def stop_recording(self) -> None:
-        """Disable feature logging."""
-        self._recording = False
-        logger.info(
-            "Dataset recording stopped — %d samples logged", self._sample_count
-        )
+        with self._lock:
+            self._recording = False
+            samples = self._sample_count
+        logger.info("Dataset recording stopped - %d samples logged", samples)
 
     @property
     def is_recording(self) -> bool:
-        return self._recording
+        with self._lock:
+            return self._recording
 
     @property
     def sample_count(self) -> int:
-        return self._sample_count
+        with self._lock:
+            return self._sample_count
+
+    @property
+    def csv_path(self) -> Path:
+        return self._csv_path
 
     # ------------------------------------------------------------------
     # Logging
@@ -118,77 +145,51 @@ class DatasetLogger:
         result: dict[str, Any],
         motion_delta: float = 0.0,
     ) -> None:
-        """Log a single frame's features to the CSV dataset.
+        """Log one classification result as a 54-feature CSV row.
 
-        Parameters
-        ----------
-        result : dict
-            Standardised pose-classification result from ``PoseClassifier.classify()``.
-        motion_delta : float
-            Bounding-box scale delta from the temporal tracker.
+        ``result`` is the payload returned by ``PoseClassifier.classify()`` or
+        the equivalent offline extraction dictionary.  Only the first
+        candidate is logged; offline ingestion calls this once per candidate.
         """
+        with self._lock:
+            self._log_frame_locked(result, motion_delta)
+
+    def _log_frame_locked(
+        self,
+        result: dict[str, Any],
+        motion_delta: float,
+    ) -> None:
         if not self._recording:
             return
 
-        row: dict[str, str | float] = {}
+        bbox = _first(result.get("bounding_boxes"))
+        if bbox is None:
+            bbox = result.get("bbox")
 
-        # Metadata
-        row["timestamp"] = datetime.now().isoformat()
-        row["pose_id"] = result.get("pose_id", "P01")
-        row["confidence"] = round(result.get("confidence", 0.0), 4)
+        keypoints = _first_keypoints(result.get("keypoints"))
+        features = feature_dict_from_components(
+            keypoints=keypoints,
+            bbox=bbox,
+            head_pose=result.get("head_pose"),
+            geometric=result.get("geometric_features"),
+            spatial=result.get("spatial_features"),
+            motion_delta=motion_delta,
+        )
 
-        # Keypoints (flatten 17x3 -> 34 values)
-        kpts = result.get("keypoints", [])
-        if kpts and isinstance(kpts[0], list):
-            kpts_arr = kpts[0]  # first person
-        elif kpts and hasattr(kpts[0], "shape"):
-            kpts_arr = kpts[0]
-        else:
-            kpts_arr = None
-
-        if kpts_arr is not None:
-            try:
-                import numpy as np
-                if isinstance(kpts_arr, np.ndarray) and kpts_arr.ndim == 2:
-                    for i in range(min(17, kpts_arr.shape[0])):
-                        row[f"kpt_x{i}"] = round(float(kpts_arr[i, 0]), 2)
-                        row[f"kpt_y{i}"] = round(float(kpts_arr[i, 1]), 2)
-                else:
-                    for i in range(min(17, len(kpts_arr))):
-                        row[f"kpt_x{i}"] = round(float(kpts_arr[i][0]), 2)
-                        row[f"kpt_y{i}"] = round(float(kpts_arr[i][1]), 2)
-            except Exception:
-                pass
-
-        # Fill missing keypoints with 0
-        for i in range(17):
-            row.setdefault(f"kpt_x{i}", 0.0)
-            row.setdefault(f"kpt_y{i}", 0.0)
-
-        # Head pose
-        hp = result.get("head_pose", {})
-        row["yaw"] = round(hp.get("yaw", 0.0), 4)
-        row["pitch"] = round(hp.get("pitch", 0.0), 4)
-        row["roll"] = round(hp.get("roll", 0.0), 4)
-
-        # Geometric features
-        feats = result.get("geometric_features", {})
-        for name in [
-            "elbow_flexion_left", "elbow_flexion_right", "neck_tilt_angle",
-            "wrist_to_eye_ratio", "wrist_to_ear_ratio", "eye_to_shoulder_ratio",
-            "hand_mouth_distance", "shoulder_hip_offset_ratio", "torso_leg_ratio",
-            "shoulder_width_ratio", "hip_width_ratio", "torso_asymmetry",
-        ]:
-            row[name] = round(float(feats.get(name, 0.0)), 4)
-
-        # Motion
-        row["motion_delta"] = round(motion_delta, 4)
+        row: dict[str, str | float] = {
+            "timestamp": datetime.now().isoformat(),
+            "pose_id": str(result.get("pose_id") or "P01"),
+            "confidence": round(float(result.get("confidence", 0.0)), 4),
+            "source": str(result.get("source") or "live"),
+        }
+        for name in FEATURE_NAMES:
+            row[name] = _csv_number(features.get(name))
 
         try:
             self._writer.writerow(row)
             self._file.flush()
             self._sample_count += 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a log failure must not kill inference
             logger.error("Failed to write CSV row: %s", exc)
 
     # ------------------------------------------------------------------
@@ -196,12 +197,15 @@ class DatasetLogger:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Flush and close the CSV file handle."""
-        try:
-            self._file.flush()
-            self._file.close()
-        except Exception:
-            pass
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            try:
+                self._file.flush()
+                self._file.close()
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         self.close()

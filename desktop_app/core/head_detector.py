@@ -25,6 +25,12 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from desktop_app.core.camera_thread import CameraThread
 from desktop_app.core import perf_config
+from desktop_app.core.torch_compile_utils import install_safe_compile
+from desktop_app.core.vision_utils import (
+    LetterboxBuffer,
+    configure_opencv_threads,
+    letterbox_square,
+)
 
 try:
     from backend.runtime import (
@@ -78,6 +84,93 @@ def _head_class_ids(model: Any) -> set[int]:
         if "head" in str(name).lower()
     }
     return ids or {0}
+
+
+def _letterbox(
+    frame: np.ndarray,
+    size: int,
+    canvas: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, int, int]:
+    """Resize *frame* onto a fixed square canvas, preserving aspect ratio.
+
+    Ultralytics otherwise pads each frame to a shape derived from its aspect
+    ratio.  On CUDA, every new shape triggers a one-off cuDNN autotune that
+    can cost several seconds.  A fixed canvas makes the first real head pass
+    use the same tensor shape as the model's 640x640 warmup, so startup pays
+    the autotune once instead of on the first classroom frame.
+
+    When *canvas* is supplied it is reused in place; the caller must consume
+    the result before the next call.
+    """
+    return letterbox_square(frame, size, canvas=canvas)
+
+
+def detect_heads(
+    model: Any,
+    frame: np.ndarray,
+    *,
+    head_ids: set[int] | None = None,
+    device_arg: str | None = None,
+    half: bool = False,
+    conf: float | None = None,
+    imgsz: int | None = None,
+    iou: float | None = None,
+    max_det: int | None = None,
+    letterbox_buffer: LetterboxBuffer | None = None,
+) -> list[dict[str, Any]]:
+    """Run one SCUT-HEAD inference pass and return head boxes.
+
+    Shared by the head-occupancy mode and classroom initialisation so the
+    two cannot disagree about what a head detection is.  The caller owns the
+    model and device lifecycle; this helper is deliberately stateless.
+    """
+    if model is None:
+        return []
+    ids = head_ids if head_ids is not None else _head_class_ids(model)
+    size = int(imgsz if imgsz is not None else perf_config.HEAD_IMGSZ)
+    original_h, original_w = frame.shape[:2]
+    if letterbox_buffer is not None and letterbox_buffer.size == size:
+        canvas, scale, pad_x, pad_y = letterbox_buffer.apply(frame)
+    else:
+        canvas, scale, pad_x, pad_y = _letterbox(frame, size)
+    with torch.inference_mode():
+        results = model(
+            canvas,
+            imgsz=size,
+            conf=conf if conf is not None else perf_config.HEAD_CONF,
+            iou=iou if iou is not None else perf_config.HEAD_NMS_IOU,
+            max_det=max_det if max_det is not None else perf_config.HEAD_MAX_DET,
+            classes=sorted(ids),
+            device=device_arg,
+            quantize=16 if half else None,
+            verbose=False,
+        )
+    result = results[0]
+    heads: list[dict[str, Any]] = []
+    if result.boxes is not None and len(result.boxes):
+        boxes = result.boxes.xyxy.cpu().numpy()
+        scores = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(np.int32)
+        # The class filter above already runs in NMS; keep a vectorised guard
+        # so a model with differently named classes cannot leak a non-head box
+        # into the occupancy count.
+        keep = np.isin(classes, list(ids))
+        if not keep.all():
+            boxes, scores = boxes[keep], scores[keep]
+        # Undo the letterbox so every caller receives original-frame pixels.
+        boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+        boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, original_w)
+        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, original_h)
+        heads = [
+            {
+                "box": [int(v) for v in box],
+                "confidence": round(float(score), 3),
+            }
+            for box, score in zip(boxes, scores)
+        ]
+    heads.sort(key=lambda item: item["confidence"], reverse=True)
+    return heads
 
 
 def render_head_hud(
@@ -205,6 +298,8 @@ class HeadCountWorker(QThread):
         self._gt_loaded = False
         self._inference_fps = _FpsCounter()
         self._capture_fps = _FpsCounter()
+        configure_opencv_threads()
+        self._letterbox_buffer = LetterboxBuffer(perf_config.HEAD_IMGSZ)
 
     def stop(self) -> None:
         self._running = False
@@ -304,6 +399,7 @@ class HeadCountWorker(QThread):
                 verbose=False,
             )
             self._head_ids = _head_class_ids(self._model)
+            install_safe_compile(self._model, "head")
             message = (
                 f"Head detector loaded: {Path(path).name} "
                 f"({self._device.type}{', FP16' if self._half else ''})"
@@ -378,39 +474,14 @@ class HeadCountWorker(QThread):
         return mapping
 
     def _detect(self, frame: np.ndarray) -> list[dict[str, Any]]:
-        with torch.inference_mode():
-            results = self._model(
-                frame,
-                imgsz=perf_config.HEAD_IMGSZ,
-                conf=perf_config.HEAD_CONF,
-                iou=perf_config.HEAD_NMS_IOU,
-                max_det=perf_config.HEAD_MAX_DET,
-                classes=sorted(self._head_ids),
-                device=self._device_arg,
-                quantize=16 if self._half else None,
-                verbose=False,
-            )
-        result = results[0]
-        heads: list[dict[str, Any]] = []
-        if result.boxes is not None and len(result.boxes):
-            boxes = result.boxes.xyxy.cpu().numpy()
-            scores = result.boxes.conf.cpu().numpy()
-            classes = result.boxes.cls.cpu().numpy().astype(np.int32)
-            # The class filter above already runs in NMS; keep a vectorised
-            # guard so a model with differently named classes cannot leak a
-            # non-head box into the occupancy count.
-            keep = np.isin(classes, list(self._head_ids))
-            if not keep.all():
-                boxes, scores = boxes[keep], scores[keep]
-            heads = [
-                {
-                    "box": [int(v) for v in box],
-                    "confidence": round(float(score), 3),
-                }
-                for box, score in zip(boxes, scores)
-            ]
-        heads.sort(key=lambda item: item["confidence"], reverse=True)
-        return heads
+        return detect_heads(
+            self._model,
+            frame,
+            head_ids=self._head_ids,
+            device_arg=self._device_arg,
+            half=self._half,
+            letterbox_buffer=self._letterbox_buffer,
+        )
 
     # ------------------------------------------------------------------
     # Result / HUD

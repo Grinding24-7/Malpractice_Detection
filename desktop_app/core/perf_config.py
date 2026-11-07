@@ -26,6 +26,17 @@ from __future__ import annotations
 
 import os
 
+
+def _csv_set(name: str, default: str) -> frozenset[str]:
+    """Parse a comma-separated environment variable into a label set."""
+    raw = os.environ.get(name, default)
+    return frozenset(
+        part.strip().lower()
+        for part in raw.split(",")
+        if part.strip()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Compute device / inference precision
 # ---------------------------------------------------------------------------
@@ -50,6 +61,15 @@ POSE_IMGSZ: int = int(os.environ.get("IP_POSE_IMGSZ", "640"))
 # Cap on persons reported per frame.  Exam rooms rarely exceed a handful of
 # students; a low cap keeps post-processing (and MediaPipe crops) bounded.
 POSE_MAX_DET: int = int(os.environ.get("IP_POSE_MAX_DET", "8"))
+
+# ByteTrack keeps a persistent candidate id for every person across frames.
+# The desktop app binds those ids to the SCUT-HEAD seat anchors established
+# during startup, so a candidate that is partly edge-clipped keeps its seat
+# identity instead of being re-counted as a new person.
+ENABLE_BYTETRACK: bool = os.environ.get(
+    "IP_ENABLE_BYTETRACK", "1"
+) not in ("0", "false", "False")
+BYTETRACK_CONFIG: str = os.environ.get("IP_BYTETRACK_CONFIG", "bytetrack.yaml")
 
 # ---------------------------------------------------------------------------
 # Object detection (phone / book / laptop)
@@ -195,6 +215,99 @@ OBJ_ESCALATE_TO: dict[str, tuple[str, float]] = {
     "earbuds": ("P26", 0.78),
 }
 
+# ── Authorized vs unauthorized documents ─────────────────────────────────
+# A written exam legitimately puts paper on every desk.  The distinction that
+# matters is not "paper exists" but "paper the candidate is allowed to have".
+# The custom desk model exposes both sides explicitly:
+#   * answer_sheet / exam_booklet / exam_paper are the venue's own materials;
+#   * notebook / loose_scratch_paper / sheet_of_paper_stack are unauthorized
+#     documents when they intersect the candidate's designated desk space.
+# The zone check is deliberately spatial: the same notebook in a bag on the
+# floor is not evidence, while one opened on the desk is.
+OBJ_AUTHORIZED_DOCUMENT_CLASSES: frozenset[str] = _csv_set(
+    "IP_OBJ_AUTHORIZED_DOCS",
+    "answer_sheet,exam_booklet,exam_paper",
+)
+OBJ_UNAUTHORIZED_DOCUMENT_CLASSES: frozenset[str] = _csv_set(
+    "IP_OBJ_UNAUTHORIZED_DOCS",
+    # ``scratch_paper`` is accepted as an alias for the trained
+    # ``loose_scratch_paper`` class so a deployment that names the class
+    # differently is still treated as an unauthorized document.
+    "notebook,loose_scratch_paper,scratch_paper,sheet_of_paper_stack",
+)
+
+# Device-class labels measured against a wrist.  Kept here (rather than in
+# each rule) so the phone, laptop, tablet and headphone rules cannot drift
+# apart about what counts as a hand-held device.
+OBJ_DEVICE_CLASSES: frozenset[str] = _csv_set(
+    "IP_OBJ_DEVICE_CLASSES",
+    "cell_phone,phone,device,laptop,tablet,headphones",
+)
+
+# Verdict + confidence floor for an unauthorized document inside the desk
+# zone.  Any unauthorized document that substantially overlaps the candidate's
+# desk space is note-peeking material (P13).  Authorized documents are
+# intentionally absent from this map.
+OBJ_DOC_ZONE_ESCALATE_TO: dict[str, tuple[str, float]] = {
+    "notebook": ("P13", 0.75),
+    "loose_scratch_paper": ("P13", 0.75),
+    "scratch_paper": ("P13", 0.75),
+    "sheet_of_paper_stack": ("P13", 0.75),
+}
+
+# Designated desk space for one candidate, as a fraction of their person box.
+# The zone starts below the torso (a document held to the chest is a different
+# finding), extends laterally past the body, and reaches below the box to
+# include the desk edge nearest the camera.
+OBJ_DESK_ZONE_TOP_RATIO: float = float(
+    os.environ.get("IP_OBJ_DESK_ZONE_TOP", "0.55")
+)
+OBJ_DESK_ZONE_LATERAL_EXPAND: float = float(
+    os.environ.get("IP_OBJ_DESK_ZONE_LATERAL", "0.35")
+)
+OBJ_DESK_ZONE_BOTTOM_EXPAND: float = float(
+    os.environ.get("IP_OBJ_DESK_ZONE_BOTTOM", "0.15")
+)
+# Fraction of the document box that must fall inside the candidate's desk
+# zone.  The project requirement is a strict majority (> 50%): a notebook
+# lying mostly on the desk is candidate material, while one merely touching
+# the boundary or held at the chest is not.
+OBJ_DOC_ZONE_MIN_OVERLAP: float = float(
+    os.environ.get("IP_OBJ_DOC_ZONE_OVERLAP", "0.50")
+)
+
+# ---------------------------------------------------------------------------
+# Metric 3D depth perception (solvePnP)
+# ---------------------------------------------------------------------------
+# Nominal intrinsics for a 1280x720 camera, as required by the project.
+# metric_depth.camera_matrix() scales these proportionally for any other
+# frame size.  The solvePnP model points are in metres, so tvec.z is the
+# candidate's distance from the lens in metres.
+METRIC_NOMINAL_WIDTH: int = int(os.environ.get("IP_METRIC_WIDTH", "1280"))
+METRIC_NOMINAL_HEIGHT: int = int(os.environ.get("IP_METRIC_HEIGHT", "720"))
+METRIC_FX: float = float(os.environ.get("IP_METRIC_FX", "1000.0"))
+METRIC_FY: float = float(os.environ.get("IP_METRIC_FY", "1000.0"))
+METRIC_CX: float = float(os.environ.get("IP_METRIC_CX", "640.0"))
+METRIC_CY: float = float(os.environ.get("IP_METRIC_CY", "360.0"))
+
+# Landmark visibility needed before a point may contribute to a PnP solve.
+METRIC_MIN_VISIBILITY: float = float(
+    os.environ.get("IP_METRIC_MIN_VIS", "0.50")
+)
+# Reject implausible solves: a candidate closer than 5 cm or farther than
+# 20 m is a bad PnP solution, not a student.
+METRIC_MIN_DEPTH_M: float = float(
+    os.environ.get("IP_METRIC_MIN_DEPTH", "0.05")
+)
+METRIC_MAX_DEPTH_M: float = float(
+    os.environ.get("IP_METRIC_MAX_DEPTH", "20.0")
+)
+# Mean reprojection error above this means the generic face/torso model did
+# not fit the landmarks well enough to trust the translation.
+METRIC_MAX_REPROJECTION_PX: float = float(
+    os.environ.get("IP_METRIC_MAX_REPROJ", "35.0")
+)
+
 # ---------------------------------------------------------------------------
 # Positive neutral posture filter
 # ---------------------------------------------------------------------------
@@ -228,11 +341,18 @@ NEUTRAL_WRIST_OSC_WINDOW: int = int(
 )
 
 # NEUTRAL_THINKING: wrist resting on cheek/chin with no device near it.
+# The cheek contact is a pixel-domain proximity test (it is about the hand
+# touching the face); the "no device" test is metric in the live path, per
+# the 15 cm phone-use radius.  The pixel value remains only as a fallback for
+# callers that have no solvePnP depth (unit tests, legacy backend).
 NEUTRAL_THINK_CHEEK_PX: float = float(
     os.environ.get("IP_NEUTRAL_CHEEK_PX", "50.0")
 )
 NEUTRAL_THINK_NO_OBJ_PX: float = float(
     os.environ.get("IP_NEUTRAL_NO_OBJ_PX", "50.0")
+)
+NEUTRAL_THINK_DEVICE_M: float = float(
+    os.environ.get("IP_NEUTRAL_DEVICE_M", "0.15")
 )
 
 # NEUTRAL_GLANCE: brief upward pitch (checking the clock / invigilator) that
@@ -299,7 +419,12 @@ CHIN_REST_SUSTAINED_SEC: float = float(
 # raw Euclidean wrist-to-bbox-centre distance, which is what phone use
 # actually looks like from a camera.
 
-# Wrist-to-phone-bbox-centre distance under which a phone is "usable".
+# Metric wrist-to-object distance under which a device is "in hand".
+# The live P31 decision uses this value exclusively; the pixel threshold
+# below is retained only for the legacy backend/unit-test path.
+PHONE_WRIST_DIST_M: float = float(
+    os.environ.get("IP_PHONE_WRIST_M", "0.15")
+)
 PHONE_WRIST_DIST_PX: float = float(
     os.environ.get("IP_PHONE_WRIST_PX", "120.0")
 )
@@ -315,12 +440,131 @@ EARBUDS_EAR_DIST_PX: float = float(
 
 # Throttle for the concurrent desk-object pass.  It runs on its own thread,
 # so this bounds CPU rather than correctness -- tracks persist between passes.
-PROX_EVERY_N_FRAMES: int = int(os.environ.get("IP_PROX_EVERY_N", "3"))
+# 1-in-8 at 10 inference FPS is one desk pass every ~0.8 s; the classifier's
+# 12-frame stability gate still requires ~1.2 s of sustained evidence, so the
+# throttle cannot make a real phone-use episode disappear.
+PROX_EVERY_N_FRAMES: int = int(os.environ.get("IP_PROX_EVERY_N", "8"))
+
+# Temporal persistence for the proximity verdict.  A phone must be re-sighted
+# with a wrist within PHONE_WRIST_DIST_PX on at least this many throttled
+# passes before P31_PHONE_USABILITY may fire.  One lucky frame of detector
+# noise is not "the student is using a phone".
+PROX_MIN_HITS: int = int(os.environ.get("IP_PROX_MIN_HITS", "3"))
+
 # Candidate crop expansion, as a fraction of the candidate box, so the desk
-# surface immediately in front of the student is inside the crop.
+# surface immediately in front of the student is inside the crop.  Retained
+# for compatibility with deployments that still use a candidate crop; the
+# live path now uses the desk ROI below.
 PROX_CROP_EXPAND: float = float(os.environ.get("IP_PROX_CROP_EXPAND", "0.25"))
+
+# Desk ROI for the concurrent pass: the lower part of the frame around the
+# candidate, not the candidate's torso.  A phone is usually set down beside
+# the hand, outside the person box.  The ROI is detected at OBJ_IMGSZ (416),
+# so a wide desk band costs no more than a tight torso crop.
+PROX_DESK_TOP_RATIO: float = float(
+    os.environ.get("IP_PROX_DESK_TOP", "0.45")
+)
+PROX_DESK_LATERAL_SHOULDER_WIDTHS: float = float(
+    os.environ.get("IP_PROX_DESK_LATERAL", "1.5")
+)
+PROX_DESK_BOTTOM_EXPAND: float = float(
+    os.environ.get("IP_PROX_DESK_BOTTOM", "0.15")
+)
+
 # Confidence floor for the desk-object detector inside the proximity thread.
 PROX_OBJ_CONF: float = float(os.environ.get("IP_PROX_OBJ_CONF", "0.35"))
+
+# ---------------------------------------------------------------------------
+# Classroom initialisation / SCUT-HEAD seat anchors
+# ---------------------------------------------------------------------------
+# The first CLASSROOM_INIT_FRAMES frames are used to count seated heads with
+# the SCUT-HEAD detector.  That count becomes the classroom's seat anchors
+# (Seat_01..Seat_N), which are then bound to ByteTrack ids.  An edge-clipped
+# candidate that briefly loses its person box can therefore keep its seat
+# identity instead of being re-counted as a new person.
+CLASSROOM_INIT_FRAMES: int = int(os.environ.get("IP_INIT_FRAMES", "30"))
+# Hard ceiling so a dead/stalled camera cannot hold the inference worker in
+# initialisation forever.  Initialisation runs on the worker thread, never the
+# UI thread.
+CLASSROOM_INIT_MAX_SEC: float = float(os.environ.get("IP_INIT_MAX_SEC", "12.0"))
+# A head cluster must be seen on at least this fraction of init frames (and at
+# least CLASSROOM_INIT_MIN_HITS times) to become a seat anchor.  This rejects
+# one-frame detector noise without requiring every frame to be perfect.
+CLASSROOM_INIT_MIN_HITS: int = int(os.environ.get("IP_INIT_MIN_HITS", "3"))
+CLASSROOM_INIT_MIN_HIT_RATIO: float = float(
+    os.environ.get("IP_INIT_MIN_RATIO", "0.20")
+)
+# Ignore implausibly large boxes during init (a close-up standing person is
+# not a seated classroom candidate in an overhead/CCTV view).
+CLASSROOM_INIT_MAX_HEAD_AREA_RATIO: float = float(
+    os.environ.get("IP_INIT_MAX_HEAD_AREA", "0.15")
+)
+SEAT_ANCHOR_MIN_CONF: float = float(
+    os.environ.get("IP_SEAT_MIN_CONF", "0.30")
+)
+# A head box must overlap an existing anchor at least this much to be treated
+# as the same seat across init frames.
+SEAT_ANCHOR_CLUSTER_IOU: float = float(
+    os.environ.get("IP_SEAT_CLUSTER_IOU", "0.25")
+)
+
+# Continuous SCUT-HEAD anchoring.  After the 30-frame initialisation the
+# same loaded head detector runs inside the worker's single sequential cycle,
+# so every pose hypothesis is checked against the current head boxes instead
+# of a 30-frame-old snapshot.  One-in-two is the production default: the
+# cached boxes are reused on the skipped frame, so the only cost is one frame
+# of anchor lag, while the saved head-model pass is large enough to keep the
+# inference loop above its 4 FPS floor on CPU/entry-GPU laptops.
+ENABLE_LIVE_HEAD_ANCHORS: bool = os.environ.get(
+    "IP_LIVE_HEAD_ANCHORS", "1"
+) not in ("0", "false", "False")
+LIVE_HEAD_EVERY_N_FRAMES: int = int(
+    os.environ.get("IP_LIVE_HEAD_EVERY_N", "2")
+)
+# A live head may update an existing anchor's centre by this fraction per
+# observation.  Seat identity is fixed; only the box follows the student.
+SEAT_ANCHOR_LIVE_SMOOTHING: float = float(
+    os.environ.get("IP_SEAT_LIVE_SMOOTH", "0.25")
+)
+
+# Candidate boundary validation.  A person box must contain a head in its
+# upper 30%: without that, a box is a clipped torso/leg fragment, not a
+# student.  Limbs that leave the box are still attributed to the candidate
+# while they are within 1.2 shoulder-widths of its edge.
+# Head landmarks outside the matched SCUT box by more than this fraction of
+# the head box size are treated as a second head's keypoints and masked out,
+# which is what "restrict skeletal keypoints" means in the live path.
+HEAD_UPPER_BODY_RATIO: float = float(
+    os.environ.get("IP_HEAD_UPPER_RATIO", "0.30")
+)
+LIMB_ATTRIBUTION_SHOULDER_WIDTHS: float = float(
+    os.environ.get("IP_LIMB_ATTRIBUTION_SW", "1.2")
+)
+HEAD_KEYPOINT_MARGIN_RATIO: float = float(
+    os.environ.get("IP_HEAD_KEYPOINT_MARGIN", "0.50")
+)
+
+# Boundary-clip continuity guard.  A candidate whose box touches the frame
+# edge is "clipped"; if it disappears for a few frames the seat is held
+# rather than declaring P16 Absent Seat.  At 10 inference FPS this is ~1.5 s.
+CLIP_GUARD_EDGE_MARGIN_RATIO: float = float(
+    os.environ.get("IP_CLIP_EDGE_MARGIN", "0.02")
+)
+CLIP_GUARD_GRACE_FRAMES: int = int(
+    os.environ.get("IP_CLIP_GRACE_FRAMES", "15")
+)
+# Boxes overlapping this much are the same detection duplicated by a crop /
+# overlay, not two students.
+CLIP_GUARD_DUPLICATE_IOU: float = float(
+    os.environ.get("IP_CLIP_DUP_IOU", "0.85")
+)
+
+# Fallback IoU tracker (used when ByteTrack ids are unavailable).
+TRACK_MAX_AGE_FRAMES: int = int(os.environ.get("IP_TRACK_MAX_AGE", "10"))
+TRACK_MIN_IOU: float = float(os.environ.get("IP_TRACK_MIN_IOU", "0.20"))
+TRACK_MAX_CENTER_SHIFT_RATIO: float = float(
+    os.environ.get("IP_TRACK_MAX_SHIFT", "0.20")
+)
 
 # ---------------------------------------------------------------------------
 # HUD alert sustain
@@ -557,7 +801,18 @@ def describe() -> str:
         f"warn_ms={WARN_THRESHOLD_MS} warmup={WARMUP_FRAMES} "
         f"streak={ANOMALY_MIN_STREAK_FRAMES} margin={ANOMALY_MIN_MARGIN} "
         f"neutral=(writing {NEUTRAL_WRITING_PITCH_MIN}..{NEUTRAL_WRITING_PITCH_MAX} "
-        f"cheek@{NEUTRAL_THINK_CHEEK_PX}px glance<{NEUTRAL_GLANCE_MAX_SEC}s) "
-        f"prox=(dist<{PHONE_WRIST_DIST_PX}px conf>{PHONE_MIN_CONF} "
-        f"every={PROX_EVERY_N_FRAMES}) alert_sustain={ALERT_SUSTAIN_FRAMES}"
+        f"cheek@{NEUTRAL_THINK_CHEEK_PX}px device>{NEUTRAL_THINK_DEVICE_M}m "
+        f"glance<{NEUTRAL_GLANCE_MAX_SEC}s) "
+        f"metric=(K f{METRIC_FX:.0f} c({METRIC_CX:.0f},{METRIC_CY:.0f}) "
+        f"phone<{PHONE_WRIST_DIST_M}m) "
+        f"prox=(conf>{PHONE_MIN_CONF} hits>={PROX_MIN_HITS} "
+        f"every={PROX_EVERY_N_FRAMES} roi_top={PROX_DESK_TOP_RATIO}) "
+        f"doc_zone=(overlap>{OBJ_DOC_ZONE_MIN_OVERLAP:.0%} "
+        f"authorized={len(OBJ_AUTHORIZED_DOCUMENT_CLASSES)} "
+        f"unauthorized={len(OBJ_UNAUTHORIZED_DOCUMENT_CLASSES)}) "
+        f"init=(frames={CLASSROOM_INIT_FRAMES} max={CLASSROOM_INIT_MAX_SEC}s) "
+        f"seat=(head_upper={HEAD_UPPER_BODY_RATIO} limb={LIMB_ATTRIBUTION_SHOULDER_WIDTHS}sw "
+        f"live_heads={ENABLE_LIVE_HEAD_ANCHORS}/{LIVE_HEAD_EVERY_N_FRAMES} "
+        f"clip_grace={CLIP_GUARD_GRACE_FRAMES}) "
+        f"bytetrack={ENABLE_BYTETRACK} alert_sustain={ALERT_SUSTAIN_FRAMES}"
     )

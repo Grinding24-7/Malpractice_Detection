@@ -30,7 +30,14 @@ from typing import Any
 import cv2
 import numpy as np
 
-from desktop_app.core import perf_config
+from desktop_app.core import metric_depth, perf_config
+from desktop_app.core.feature_schema import (
+    FEATURE_NAMES as _SCHEMA_FEATURE_NAMES,
+    GEOMETRIC_FEATURES,
+    feature_dict_from_components,
+    validate_feature_names,
+    vector_from_dict,
+)
 from desktop_app.core.head_pose import HeadPoseEstimator
 from desktop_app.core.object_context import (
     MP_LEFT_SHOULDER,
@@ -46,6 +53,13 @@ from desktop_app.core.object_context import (
     resolve_object_model,
     shoulder_width_of,
 )
+from desktop_app.core.seat_anchor import (
+    BoundaryClipGuard,
+    CandidateTracker,
+    SeatAnchorRegistry,
+)
+from desktop_app.core.torch_compile_utils import install_safe_compile
+from desktop_app.core.vision_utils import configure_opencv_threads
 
 try:
     from backend.runtime import (
@@ -169,21 +183,20 @@ POSE_MAP: dict[str, str] = {
     "P38": "Unusual Object",
 }
 
-# Ordered feature names for scikit-learn classifier input vector
-FEATURE_NAMES: list[str] = [
-    "elbow_flexion_left",
-    "elbow_flexion_right",
-    "neck_tilt_angle",
-    "wrist_to_eye_ratio",
-    "wrist_to_ear_ratio",
-    "eye_to_shoulder_ratio",
-    "hand_mouth_distance",
-    "shoulder_hip_offset_ratio",
-    "torso_leg_ratio",
-    "shoulder_width_ratio",
-    "hip_width_ratio",
-    "torso_asymmetry",
-]
+# Ordered feature names for the scikit-learn classifier input vector.
+# The canonical definition lives in feature_schema so the logger, trainer and
+# runtime cannot drift apart.  Previously this list held only the 12 geometric
+# features while the trainer used 50, which made every trained model fail at
+# prediction time and silently fall back to the rule engine.
+FEATURE_NAMES: list[str] = list(_SCHEMA_FEATURE_NAMES)
+GEOMETRIC_FEATURE_NAMES: list[str] = list(GEOMETRIC_FEATURES)
+
+# Verdicts that describe an object or the room rather than the pose.  A
+# pose-only classifier must never invent these; they stay with the rule and
+# desk-object engines.
+_ML_OBJECT_VERDICTS = frozenset(
+    {"P13", "P16", "P26", "P31_PHONE_USABILITY", "P35", "P38"}
+)
 
 # Features are NaN when the underlying landmarks are not visible enough to
 # measure.  These helpers keep rule evaluation honest about that.
@@ -287,9 +300,9 @@ NEUTRAL_THINKING = "NEUTRAL_THINKING"
 NEUTRAL_GLANCE = "NEUTRAL_GLANCE"
 
 NEUTRAL_LABELS: dict[str, str] = {
-    NEUTRAL_WRITING: "Writing (Neutral)",
-    NEUTRAL_THINKING: "Thinking (Neutral)",
-    NEUTRAL_GLANCE: "Looking Up (Neutral)",
+    NEUTRAL_WRITING: "Writing",
+    NEUTRAL_THINKING: "Thinking",
+    NEUTRAL_GLANCE: "Glancing Up",
 }
 
 # Threat verdicts a neutral state overrides.  P14 is the Looking Down
@@ -305,6 +318,14 @@ _NEUTRAL_SUPPRESSES: frozenset[str] = frozenset({
 # fallback's spelling of the same class.
 _NEUTRAL_DEVICE_LABELS: frozenset[str] = frozenset({
     "cell_phone", "device", "phone",
+})
+
+# Device labels whose P38 escalation must also clear the metric 0.15 m
+# wrist-distance gate in the live path.  The pixel threshold remains only as
+# a legacy fallback for callers without solvePnP depth.  Earbuds are
+# deliberately excluded: P26 is an ear-proximity verdict, not a wrist one.
+_DEVICE_WRIST_GATED: frozenset[str] = frozenset({
+    "cell_phone", "phone", "device", "laptop", "tablet", "headphones",
 })
 
 
@@ -330,6 +351,8 @@ def check_neutral_alignment(
     desk_objects: list[dict[str, Any]] | None,
     bbox: list[int] | None = None,
     temporal: "_TemporalBuffer | None" = None,
+    depth_info: dict[str, Any] | None = None,
+    frame_shape: tuple[int, ...] | None = None,
 ) -> str | None:
     """Classify the current frame as a benign exam state, or ``None``.
 
@@ -353,6 +376,14 @@ def check_neutral_alignment(
         Sliding window that carries wrist history (micro-oscillation) and
         the glance clock.  Without it the stateful tests cannot run and
         only the stateless parts are evaluated.
+    depth_info
+        ``metric_depth.estimate_candidate_depth()`` output.  When present,
+        the "no device near the hand" test uses the 0.15 m metric radius
+        instead of the legacy pixel radius, so thinking is only declared
+        when the hand is genuinely far from a phone.
+    frame_shape
+        Video frame shape, needed to scale the PnP intrinsics for the metric
+        device test.
 
     States, in priority order:
 
@@ -414,11 +445,14 @@ def check_neutral_alignment(
             if _dist_2d(wrist, cheek) > perf_config.NEUTRAL_THINK_CHEEK_PX:
                 continue
             # Hand at the cheek is only innocent when nothing the hand could
-            # be holding is anywhere near it.
+            # be holding is anywhere near it.  In the live path this is a
+            # metric 15 cm test; the pixel radius remains only as a fallback
+            # for callers without solvePnP depth.
             if not any(
                 obj.get("label") in _NEUTRAL_DEVICE_LABELS
-                and _obj_within(obj.get("box"), wrist,
-                                perf_config.NEUTRAL_THINK_NO_OBJ_PX)
+                and _device_near_wrist(
+                    obj, wrist, lms, depth_info, frame_shape
+                )
                 for obj in (desk_objects or [])
             ):
                 return NEUTRAL_THINKING
@@ -479,9 +513,72 @@ def _obj_within(
     return math.sqrt(dx * dx + dy * dy) <= max_px
 
 
+def _metric_box_distance_m(
+    point: tuple[float, float],
+    obj_box: Any,
+    depth_info: dict[str, Any] | None,
+    frame_shape: tuple[int, ...] | None,
+) -> float | None:
+    """Metric distance from a pixel point to a box centre on the depth plane.
+
+    Returns None when the solvePnP depth is unavailable; callers must fail
+    closed rather than silently substitute a pixel threshold in the live
+    path.
+    """
+    if not depth_info or depth_info.get("depth_m") is None:
+        return None
+    if not obj_box or len(obj_box) != 4:
+        return None
+    depth_m = float(depth_info["depth_m"])
+    intrinsics = depth_info.get("camera_matrix")
+    object_point = metric_depth.box_center_point_m(
+        obj_box, depth_m, intrinsics, frame_shape
+    )
+    if object_point is None:
+        return None
+    wrist_point = metric_depth.pixel_to_point_m(
+        point[0], point[1], depth_m, intrinsics, frame_shape
+    )
+    return float(np.linalg.norm(wrist_point - object_point))
+
+
+def _device_near_wrist(
+    obj: dict[str, Any],
+    wrist: tuple[float, float],
+    landmarks: list[tuple[float, float, float]] | None,
+    depth_info: dict[str, Any] | None,
+    frame_shape: tuple[int, ...] | None,
+) -> bool:
+    """True when a device is within the neutral-thinking exclusion radius.
+
+    The live measurement is metric (``NEUTRAL_THINK_DEVICE_M``, 15 cm).  The
+    pixel fallback exists only for callers that have no depth solve -- the
+    backend and unit tests -- and is never used when a metric distance was
+    already measured for the object.
+    """
+    if str(obj.get("label", "")).lower() not in _NEUTRAL_DEVICE_LABELS:
+        return False
+    metric = obj.get("wrist_dist_m")
+    if metric is not None:
+        try:
+            return float(metric) <= perf_config.NEUTRAL_THINK_DEVICE_M
+        except (TypeError, ValueError):
+            pass
+    measured = _metric_box_distance_m(
+        wrist, obj.get("box"), depth_info, frame_shape
+    )
+    if measured is not None:
+        return measured <= perf_config.NEUTRAL_THINK_DEVICE_M
+    return _obj_within(
+        obj.get("box"), wrist, perf_config.NEUTRAL_THINK_NO_OBJ_PX
+    )
+
+
 def _cheek_contact_active(
     keypoints: list[tuple[float, float, float]] | None,
     desk_objects: list[dict[str, Any]] | None,
+    depth_info: dict[str, Any] | None = None,
+    frame_shape: tuple[int, ...] | None = None,
 ) -> bool:
     """True when a visible wrist rests at the cheek with no device near it.
 
@@ -503,9 +600,9 @@ def _cheek_contact_active(
         if _dist_2d(wrist, cheek) > perf_config.NEUTRAL_THINK_CHEEK_PX:
             continue
         if not any(
-            obj.get("label") in _NEUTRAL_DEVICE_LABELS
-            and _obj_within(obj.get("box"), wrist,
-                            perf_config.NEUTRAL_THINK_NO_OBJ_PX)
+            _device_near_wrist(
+                obj, wrist, lms, depth_info, frame_shape
+            )
             for obj in (desk_objects or [])
         ):
             return True
@@ -541,6 +638,290 @@ def _merge_detections(
         ):
             merged[dup_idx] = dict(det)
     return merged
+
+
+def _anchor_items(
+    scut_head_anchors: Any,
+) -> list[tuple[list[int], str | None]]:
+    """Normalise a registry / dict list / anchor list to ``(box, seat_id)``.
+
+    The seat id is carried through so a validated person box can be attributed
+    to its locked seat without re-deriving it from a mutable box.  Plain lists
+    of boxes (the unit-test shape) produce items with ``seat_id=None``.
+    """
+    if scut_head_anchors is None:
+        return []
+    anchors = getattr(scut_head_anchors, "anchors", None)
+    if anchors is None and isinstance(scut_head_anchors, dict):
+        anchors = scut_head_anchors.get("anchors")
+    if anchors is None:
+        anchors = scut_head_anchors
+    items: list[tuple[list[int], str | None]] = []
+    try:
+        for anchor in anchors:
+            box = getattr(anchor, "box", None)
+            seat_id = getattr(anchor, "seat_id", None)
+            if isinstance(anchor, dict):
+                box = anchor.get("box")
+                seat_id = anchor.get("seat_id")
+            elif box is None:
+                # A bare [x1, y1, x2, y2] entry.
+                box = anchor
+            if box is not None and len(box) == 4:
+                items.append((
+                    [int(v) for v in box],
+                    str(seat_id) if seat_id is not None else None,
+                ))
+    except TypeError:
+        return []
+    return items
+
+
+def _anchor_boxes(
+    scut_head_anchors: Any,
+) -> list[list[int]]:
+    """Normalise a registry / dict list / anchor list to xyxy head boxes."""
+    return [box for box, _seat_id in _anchor_items(scut_head_anchors)]
+
+
+def _point_box_distance(
+    point: tuple[float, float], box: list[int] | list[float]
+) -> float:
+    """Euclidean distance from *point* to *box* (0 when inside)."""
+    x1, y1, x2, y2 = (float(v) for v in box)
+    px, py = point
+    dx = max(x1 - px, 0.0, px - x2)
+    dy = max(y1 - py, 0.0, py - y2)
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def mask_face_outside_head(
+    keypoints: Any,
+    head_box: list[int] | list[float] | None,
+    margin_ratio: float | None = None,
+) -> int:
+    """Blank face keypoints that cannot belong to the anchored head.
+
+    Continuous SCUT-HEAD boxes are the spatial anchor for the skeleton.  If a
+    person box overlaps a neighbouring student, MediaPipe can place the face
+    landmarks on the wrong head; those landmarks then poison head-pose and
+    neutral-posture rules.  Face points outside the matched head box (expanded
+    by ``HEAD_KEYPOINT_MARGIN_RATIO``) have their visibility set to zero, so
+    downstream rules treat them as unmeasured while body keypoints remain
+    untouched.
+    """
+    if not head_box or len(head_box) != 4 or keypoints is None:
+        return 0
+    try:
+        hx1, hy1, hx2, hy2 = (float(v) for v in head_box)
+    except (TypeError, ValueError):
+        return 0
+    if hx2 <= hx1 or hy2 <= hy1:
+        return 0
+    ratio = (
+        perf_config.HEAD_KEYPOINT_MARGIN_RATIO
+        if margin_ratio is None else float(margin_ratio)
+    )
+    margin = max(hx2 - hx1, hy2 - hy1) * max(0.0, ratio)
+    x1, y1, x2, y2 = hx1 - margin, hy1 - margin, hx2 + margin, hy2 + margin
+    face_indices = range(11) if len(keypoints) >= 33 else range(5)
+    masked = 0
+    for idx in face_indices:
+        if idx >= len(keypoints):
+            break
+        point = keypoints[idx]
+        try:
+            px, py = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (x1 <= px <= x2 and y1 <= py <= y2):
+            try:
+                point[2] = 0.0
+            except (TypeError, IndexError):
+                keypoints[idx] = (px, py, 0.0)
+            masked += 1
+    return masked
+
+
+def _keypoint_xy_vis(
+    keypoints: Any, idx: int
+) -> tuple[float, float, float] | None:
+    """Return ``(x, y, visibility)`` for a keypoint, tolerating numpy rows."""
+    if keypoints is None:
+        return None
+    try:
+        if len(keypoints) <= idx:
+            return None
+        point = keypoints[idx]
+        x, y = float(point[0]), float(point[1])
+        vis = float(point[2]) if len(point) > 2 else 1.0
+    except (TypeError, ValueError, IndexError):
+        return None
+    if x != x or y != y or vis != vis:
+        return None
+    return x, y, vis
+
+
+def validate_candidate_boundaries(
+    person_box: list[int] | None,
+    keypoints: Any,
+    scut_head_anchors: Any,
+) -> dict[str, Any]:
+    """Validate a person box against the classroom's head/seat anchors.
+
+    A candidate must contain a head in the upper 30% of its box.  The head
+    evidence is either a SCUT-HEAD anchor whose centre falls in that band or,
+    for a person who entered after initialisation, a visible nose keypoint in
+    the same band.  Boxes without either are clipped torso/leg fragments and
+    are rejected, which is what stops a pseudo-clip from being counted as an
+    extra person (P35) or as a new candidate.
+
+    Limbs that extend outside the box are still attributed to the candidate
+    while they are within ``LIMB_ATTRIBUTION_SHOULDER_WIDTHS`` shoulder-widths
+    of its edge.  The function reports how many were attributed/rejected so
+    callers can decide whether a landmark is safe to use in a rule.
+
+    Returns a dict with ``valid``, ``head_found``, ``seat_id``,
+    ``head_box``, ``upper_region``, ``limbs_attributed``, ``limbs_rejected``
+    and ``reason``.  ``head_box`` is the matched SCUT-HEAD box (live or
+    initialised) that the caller must use to restrict face landmarks.
+    """
+    result: dict[str, Any] = {
+        "valid": False,
+        "head_found": False,
+        "seat_id": None,
+        "head_box": None,
+        "upper_region": None,
+        "limbs_attributed": 0,
+        "limbs_rejected": 0,
+        "reason": "",
+    }
+    if person_box is None or len(person_box) != 4:
+        result["reason"] = "no_box"
+        return result
+    x1, y1, x2, y2 = (float(v) for v in person_box)
+    if x2 <= x1 or y2 <= y1:
+        result["reason"] = "degenerate_box"
+        return result
+
+    upper_bottom = y1 + perf_config.HEAD_UPPER_BODY_RATIO * (y2 - y1)
+    upper = [x1, y1, x2, upper_bottom]
+    result["upper_region"] = [int(v) for v in upper]
+
+    anchors = _anchor_items(scut_head_anchors)
+    if anchors:
+        best_seat: list[int] | None = None
+        best_seat_id: str | None = None
+        best_score = -1.0
+        for box, seat_id in anchors:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            inside = x1 <= cx <= x2 and y1 <= cy <= upper_bottom
+            overlap = box_iou(box, [int(v) for v in upper])
+            if not inside and overlap <= 0.0:
+                continue
+            # A head centre inside the upper band is the strongest evidence;
+            # overlap is the fallback when the box is partly clipped.
+            score = (2.0 if inside else 0.0) + overlap
+            if score > best_score:
+                best_seat, best_seat_id = box, seat_id
+                best_score = score
+        if best_seat is not None:
+            result["head_found"] = True
+            result["head_box"] = list(best_seat)
+            result["seat_id"] = best_seat_id
+            # Resolve the seat id through the registry when the caller passed
+            # a registry rather than a live-head list.
+            if result["seat_id"] is None and isinstance(
+                scut_head_anchors, SeatAnchorRegistry
+            ):
+                for anchor in scut_head_anchors.anchors:
+                    if list(anchor.box) == list(best_seat):
+                        result["seat_id"] = anchor.seat_id
+                        break
+            result["reason"] = "head_anchor"
+        else:
+            # A person who entered after initialisation has no anchor yet.
+            # A visible nose in the upper band is still real head evidence.
+            nose = _keypoint_xy_vis(keypoints, MP_NOSE)
+            if nose is not None and nose[2] > 0.5:
+                nx, ny = nose[0], nose[1]
+                if x1 <= nx <= x2 and y1 <= ny <= upper_bottom:
+                    result["head_found"] = True
+                    result["reason"] = "keypoint_nose"
+            if not result["head_found"]:
+                result["reason"] = "no_head_in_upper_band"
+                return result
+    else:
+        # No anchors yet (initialisation unavailable): do not invent a
+        # rejection rule.  The legacy pipeline had no head evidence at all.
+        result["head_found"] = True
+        result["reason"] = "no_anchors"
+
+    # Limb attribution.  Use MediaPipe's 33-point layout when available,
+    # otherwise COCO-17.  The wrist/elbow points are the ones that decide
+    # reach rules, so a point far outside the box must not be silently
+    # attributed to this candidate.
+    shoulder_w = 0.0
+    shoulder_points: list[tuple[float, float]] = []
+    limb_indices: tuple[int, ...]
+    if keypoints is not None and len(keypoints) >= 33:
+        left = _keypoint_xy_vis(keypoints, MP_LEFT_SHOULDER)
+        right = _keypoint_xy_vis(keypoints, MP_RIGHT_SHOULDER)
+        if left and right and left[2] > 0.5 and right[2] > 0.5:
+            shoulder_w = abs(left[0] - right[0])
+            shoulder_points = [(left[0], left[1]), (right[0], right[1])]
+        limb_indices = (
+            MP_LEFT_WRIST, MP_RIGHT_WRIST, MP_LEFT_ELBOW, MP_RIGHT_ELBOW,
+        )
+    elif keypoints is not None and len(keypoints) >= 17:
+        left = _keypoint_xy_vis(keypoints, 5)
+        right = _keypoint_xy_vis(keypoints, 6)
+        if left and right and left[2] > 0.5 and right[2] > 0.5:
+            shoulder_w = abs(left[0] - right[0])
+            shoulder_points = [(left[0], left[1]), (right[0], right[1])]
+        limb_indices = (9, 10, 7, 8)  # COCO wrists/elbows
+    else:
+        limb_indices = ()
+
+    margin = (
+        perf_config.LIMB_ATTRIBUTION_SHOULDER_WIDTHS * shoulder_w
+        if shoulder_w > 0 else 0.0
+    )
+    # Only the candidate's *matched* head anchor counts.  Using every
+    # classroom anchor would attribute a wrist to this candidate merely
+    # because a neighbouring student's head is nearby, which is exactly the
+    # false multi-person attribution this function exists to prevent.
+    matched_head = result.get("head_box")
+    anchor_boxes = [list(matched_head)] if matched_head else []
+    for idx in limb_indices:
+        point = _keypoint_xy_vis(keypoints, idx)
+        if point is None or point[2] <= 0.5:
+            continue
+        px, py = point[0], point[1]
+        if x1 <= px <= x2 and y1 <= py <= y2:
+            continue
+        # Attribute a limb by its distance to the nearest SCUT-HEAD anchor
+        # or shoulder joint, exactly as the requirement specifies.  A wrist
+        # reaching out of the person box is still this candidate's hand when
+        # it is within 1.2 shoulder-widths of the head/shoulder.
+        distances = [_point_box_distance((px, py), box) for box in anchor_boxes]
+        distances.extend(
+            math.hypot(px - sx, py - sy) for sx, sy in shoulder_points
+        )
+        if distances:
+            dist = min(distances)
+        else:
+            # No anchor evidence at all: preserve the legacy box-edge rule
+            # for callers running without SCUT-HEAD.
+            dist = _point_box_distance((px, py), [x1, y1, x2, y2])
+        if dist <= margin:
+            result["limbs_attributed"] += 1
+        else:
+            result["limbs_rejected"] += 1
+
+    result["valid"] = True
+    return result
 
 
 class _TemporalBuffer:
@@ -852,6 +1233,7 @@ class PoseClassifier:
     """
 
     def __init__(self) -> None:
+        configure_opencv_threads()
         self._yolo: Any = None
         self._device = resolve_device(perf_config.INFERENCE_DEVICE)
         self._device_arg = yolo_device(self._device)
@@ -872,10 +1254,17 @@ class PoseClassifier:
         self._pose_landmarker: Any = None
         self._mp_image_cls: Any = None
         self._mp_image_format: Any = None
+        # Reusable BGR->RGB crop buffers, keyed by crop width.  A fixed-width
+        # buffer keeps each row contiguous while allowing the crop height to
+        # vary with the candidate box; MediaPipe silently returns no pose for
+        # non-contiguous input, so this must never be a strided row view.
+        self._mp_rgb_buffers: dict[int, np.ndarray] = {}
         self._head_pose_estimator = HeadPoseEstimator()
         self._temporal_buffer = _TemporalBuffer()
         self._last_features: dict[str, float] = {}
         self._ml_classifier: Any = None
+        self._ml_feature_names: list[str] = []
+        self._ml_metadata: dict[str, Any] = {}
         self._slow_frame_counter = 0
         # Frames the current raw verdict has held (see _apply_stability_gate),
         # published in temporal_metrics for the HUD's alert-sustain tier.
@@ -897,6 +1286,34 @@ class PoseClassifier:
         # set_proximity).  Written only from the inference thread, between
         # frames; never shared with the detection thread directly.
         self._proximity: dict[str, Any] | None = None
+
+        # Classroom continuity: SCUT-HEAD seat anchors (set by the inference
+        # worker after initialisation), ByteTrack ids from the pose detector,
+        # and the fallback tracker / boundary guard used when those ids are
+        # unavailable or a candidate is clipped by the frame edge.
+        self._seat_anchors: SeatAnchorRegistry | None = None
+        self._last_track_ids: list[int | None] = []
+        self._last_seat_ids: list[str | None] = []
+        self._last_candidate_count: int = 0
+        self._presence_held: bool = False
+        # Continuous-SCUT head evidence for the last frame: the raw live
+        # boxes, the boundary validation result per surviving candidate, and
+        # the primary candidate's solvePnP depth.  Written only on the
+        # inference thread.
+        self._last_live_head_boxes: list[dict[str, Any]] = []
+        self._last_validations: list[dict[str, Any]] = []
+        self._last_depth_info: dict[str, Any] = {
+            "success": False,
+            "depth_m": None,
+            "position_m": None,
+            "camera_matrix": None,
+            "method": "",
+            "reprojection_error_px": None,
+        }
+        self._candidate_tracker = CandidateTracker()
+        self._clip_guard = BoundaryClipGuard()
+        self._bytetrack_failed = False
+        self._object_escalation: dict[str, Any] | None = None
         self._init_yolo()
         self._init_object_detector()
         self._init_mediapipe()
@@ -920,6 +1337,7 @@ class PoseClassifier:
                 quantize=16 if self._half else None,
                 verbose=False,
             )
+            install_safe_compile(self._yolo, "pose")
             logger.info(
                 "YOLO11n-pose loaded from %s (%s%s)",
                 model_path,
@@ -1070,14 +1488,84 @@ class PoseClassifier:
     def _load_ml_classifier(self) -> None:
         model_path = _PROJECT_ROOT / "models" / "pose_rf_classifier.pkl"
         if not model_path.exists():
-            logger.info("No ML classifier found at %s — using rules only", model_path)
+            logger.info(
+                "No ML classifier found at %s - using rules only", model_path
+            )
             return
         try:
             import joblib
-            self._ml_classifier = joblib.load(str(model_path))
-            logger.info("ML classifier loaded from %s", model_path)
+
+            artifact = joblib.load(str(model_path))
+            if isinstance(artifact, dict):
+                model = artifact.get("model")
+                names = artifact.get("feature_names")
+                metadata = {
+                    key: value
+                    for key, value in artifact.items()
+                    if key not in ("model", "feature_names")
+                }
+            else:
+                model = artifact
+                names = None
+                metadata = {}
+
+            if model is None:
+                logger.error(
+                    "ML artifact %s has no 'model' entry - using rules only",
+                    model_path,
+                )
+                return
+
+            if names is None:
+                # A bare estimator can only be accepted when its input width
+                # matches the canonical vector.  Its column order is assumed,
+                # so every model written by train_classifier.py carries names.
+                width = getattr(model, "n_features_in_", None)
+                if width != len(FEATURE_NAMES):
+                    logger.error(
+                        "ML classifier expects %s features but the runtime "
+                        "contract is %d - refusing to load %s",
+                        width,
+                        len(FEATURE_NAMES),
+                        model_path,
+                    )
+                    return
+                names = list(FEATURE_NAMES)
+                logger.warning(
+                    "ML artifact has no feature_names; assuming canonical order"
+                )
+
+            if not validate_feature_names(names):
+                logger.error(
+                    "ML classifier feature contract mismatch: artifact has %d "
+                    "columns, runtime expects %d (%s) - refusing to load",
+                    len(list(names)),
+                    len(FEATURE_NAMES),
+                    model_path,
+                )
+                return
+
+            self._ml_classifier = model
+            self._ml_feature_names = list(names)
+            self._ml_metadata = metadata
+            accuracy = metadata.get("test_accuracy")
+            if accuracy is not None:
+                logger.info(
+                    "ML classifier loaded from %s (%d features, test accuracy %.2f%%)",
+                    model_path,
+                    len(self._ml_feature_names),
+                    float(accuracy) * 100.0,
+                )
+            else:
+                logger.info(
+                    "ML classifier loaded from %s (%d features)",
+                    model_path,
+                    len(self._ml_feature_names),
+                )
         except ImportError:
-            logger.warning("scikit-learn/joblib not installed — ML classifier unavailable")
+            logger.warning(
+                "scikit-learn/joblib not installed - ML classifier unavailable"
+            )
         except Exception as exc:
             logger.warning("Failed to load ML classifier: %s", exc)
 
@@ -1121,17 +1609,82 @@ class PoseClassifier:
         """
         self._proximity = snapshot if isinstance(snapshot, dict) else None
 
+    def set_seat_anchors(
+        self, anchors: SeatAnchorRegistry | list[dict[str, Any]] | None
+    ) -> int:
+        """Install the classroom seat anchors established during startup.
+
+        Accepts the registry built by ``HeadAnchorInitializer``, a plain list
+        of anchor dicts (for tests / external callers), or None.  Returns the
+        number of locked seats.
+        """
+        if anchors is None:
+            self._seat_anchors = None
+            return 0
+        if isinstance(anchors, SeatAnchorRegistry):
+            self._seat_anchors = anchors
+        else:
+            from desktop_app.core.seat_anchor import SeatAnchor
+
+            built: list[SeatAnchor] = []
+            for i, item in enumerate(anchors):
+                if not isinstance(item, dict):
+                    continue
+                box = item.get("box") or []
+                if len(box) != 4:
+                    continue
+                built.append(SeatAnchor(
+                    seat_id=str(item.get("seat_id") or f"Seat_{i + 1:02d}"),
+                    box=[int(v) for v in box],
+                    confidence=float(item.get("confidence", 0.0)),
+                    hits=int(item.get("hits", 0)),
+                    track_id=item.get("track_id"),
+                ))
+            self._seat_anchors = SeatAnchorRegistry(
+                anchors=built, locked=bool(built)
+            )
+        return self._seat_anchors.seat_count
+
+    def seat_anchor_info(self) -> dict[str, Any]:
+        registry = self._seat_anchors
+        return {
+            "seated_count": registry.seat_count if registry else 0,
+            "seats_locked": bool(registry and registry.locked),
+            "seat_anchors": registry.as_list() if registry else [],
+        }
+
+    def warm_object_detector(
+        self,
+        frame: np.ndarray,
+        boxes: list[list[int]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run one forced desk-object pass to pay first-use model warmup.
+
+        The anomaly-triggered desk pass and the concurrent proximity pass use
+        different YOLO instances.  Their first simultaneous inference can
+        spend seconds in CUDA/driver warmup, which would otherwise appear as a
+        frozen HUD during the first live frames.  ``force=True`` does not
+        advance ``ObjectContext.detect_counter``, so this startup-only pass
+        cannot disturb the live gate accounting.
+        """
+        self._last_frame = frame
+        self._last_frame_shape = frame.shape
+        self._last_frame_width = frame.shape[1]
+        return self._detect_objects(frame, boxes or [], force=True)
+
     def _phone_proximity_hit(
         self, objects: list[dict[str, Any]]
     ) -> dict[str, Any] | None:
         """The strongest wrist-at-phone evidence in *objects*, if any.
 
-        Distance is raw Euclidean pixels between a visible wrist keypoint and
-        the detection's bbox centre (the shared ObjectContext relation uses
-        shoulder-width-normalised distances for its escalation gate; this is
-        the tighter "the hand is ON the phone" test for usability).  Both the
-        distance threshold and the confidence floor are required -- a fuzzy
-        box near a wrist, or a confident phone across the desk, is not use.
+        The live decision is metric: the wrist and the detection's bbox
+        centre are back-projected onto the candidate's solvePnP depth plane,
+        and the verdict requires a 3D Euclidean distance under
+        ``PHONE_WRIST_DIST_M`` (15 cm).  A pixel fallback is used only when
+        the depth solve failed entirely; when depth is available but an
+        object could not be measured, the object is not evidence (fail
+        closed).  The confidence floor and temporal persistence gate apply
+        to both paths.
         """
         if not objects:
             return None
@@ -1143,26 +1696,122 @@ class PoseClassifier:
         if not wrists:
             return None
 
+        depth_ok = bool(
+            self._last_depth_info
+            and self._last_depth_info.get("depth_m") is not None
+        )
         best: dict[str, Any] | None = None
-        best_dist = float("inf")
+        best_key: tuple[int, float] | None = None
         for obj in objects:
             if obj.get("label") not in _NEUTRAL_DEVICE_LABELS:
                 continue
             if float(obj.get("confidence", 0.0)) <= perf_config.PHONE_MIN_CONF:
                 continue
+            # Temporal persistence: the concurrent pass throttles detection,
+            # so a phone must be re-sighted on PROX_MIN_HITS passes.  An
+            # anomaly-path object instead carries ``persistent`` from the
+            # shared track merger.
+            if "hits" in obj:
+                if int(obj.get("hits", 0) or 0) < perf_config.PROX_MIN_HITS:
+                    continue
+            elif not obj.get("persistent"):
+                continue
             box = obj.get("box")
             if not box or len(box) != 4:
                 continue
-            cx = (box[0] + box[2]) / 2.0
-            cy = (box[1] + box[3]) / 2.0
-            dist = min(_dist_2d(w, (cx, cy)) for w in wrists)
-            if dist < best_dist:
-                best_dist = dist
+
+            metric = obj.get("wrist_dist_m")
+            if metric is not None:
+                try:
+                    dist_m = float(metric)
+                except (TypeError, ValueError):
+                    continue
+                if dist_m >= perf_config.PHONE_WRIST_DIST_M:
+                    continue
+                key = (0, dist_m)
+            elif not depth_ok:
+                # Legacy path only: no depth solve for this frame at all.
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                dist_px = min(_dist_2d(w, (cx, cy)) for w in wrists)
+                if dist_px >= perf_config.PHONE_WRIST_DIST_PX:
+                    continue
+                key = (1, dist_px)
+            else:
+                # Depth exists: an unmeasured object is not usable evidence.
+                continue
+
+            if best_key is None or key < best_key:
+                best_key = key
                 best = dict(obj)
-                best["wrist_dist"] = round(dist, 1)
-        if best is None or best_dist >= perf_config.PHONE_WRIST_DIST_PX:
-            return None
+                if key[0] == 0:
+                    best["wrist_dist_m"] = round(key[1], 4)
+                else:
+                    best["wrist_dist"] = round(key[1], 1)
         return best
+
+    @staticmethod
+    def _proximity_snapshot_phone_usable(
+        phone: dict[str, Any] | None,
+    ) -> bool:
+        """True when a snapshot phone has a measured metric wrist distance.
+
+        The proximity thread detects the object; the depth solve happens on
+        the inference thread when the lists are merged.  A snapshot entry
+        that never received that metric annotation cannot establish 15 cm
+        proximity, so it is not usable evidence.
+        """
+        if not isinstance(phone, dict):
+            return False
+        if float(phone.get("confidence", 0.0)) <= perf_config.PHONE_MIN_CONF:
+            return False
+        hits = int(phone.get("hits", 0) or 0)
+        if "hits" in phone and hits < perf_config.PROX_MIN_HITS:
+            return False
+        dist = phone.get("wrist_dist_m")
+        if dist is None:
+            return False
+        try:
+            return float(dist) < perf_config.PHONE_WRIST_DIST_M
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _device_evidence_ok(
+        obj: dict[str, Any],
+        require_wrist: bool = False,
+    ) -> bool:
+        """Live-path metric gate for device P38 escalations.
+
+        The shared spatial relation answers "can the student reach it"; the
+        phone/P38 rule additionally requires the hand to be on the device.
+        ``require_wrist=True`` is the live classify() contract: a device with
+        no measured metric distance is not evidence.  The default stays
+        lenient for the backend and unit-level escalation tests, which
+        construct objects without pose landmarks and historically relied on
+        the pixel fallback.
+        """
+        label = str(obj.get("label", "")).lower()
+        if label not in _DEVICE_WRIST_GATED:
+            return True
+        if float(obj.get("confidence", 0.0)) <= perf_config.PHONE_MIN_CONF:
+            return False
+        metric = obj.get("wrist_dist_m")
+        if metric is not None:
+            try:
+                return float(metric) < perf_config.PHONE_WRIST_DIST_M
+            except (TypeError, ValueError):
+                return False
+        if require_wrist:
+            return False
+        dist = obj.get("wrist_dist_px")
+        if dist is None:
+            dist = obj.get("wrist_dist")
+        if dist is None:
+            return True
+        if float(dist) >= perf_config.PHONE_WRIST_DIST_PX:
+            return False
+        return True
 
     def _earbuds_worn_hit(
         self, objects: list[dict[str, Any]]
@@ -1206,8 +1855,19 @@ class PoseClassifier:
             return None
         return best
 
-    def classify(self, frame: np.ndarray) -> dict[str, Any]:
+    def classify(
+        self,
+        frame: np.ndarray,
+        head_boxes: list[dict[str, Any]] | list[list[int]] | None = None,
+    ) -> dict[str, Any]:
         """Classify the frame and return a standardised result dict.
+
+        ``head_boxes`` is the current SCUT-HEAD output from the unified
+        worker cycle.  It is used *before* MediaPipe: body hypotheses with no
+        head anchor in their upper 30% are rejected, so a clipped torso or a
+        duplicate fragment never becomes a candidate or a P35 finding.
+        Surviving candidates have their face landmarks restricted to the
+        matched head box.
 
         Returns
         -------
@@ -1215,16 +1875,132 @@ class PoseClassifier:
             pose_id, pose_name, confidence, bounding_boxes,
             keypoints, landmarks, head_pose, gaze_vector,
             geometric_features, temporal_metrics, spatial_features,
-            anomalies, anomaly_flags
+            anomalies, anomaly_flags, candidate_depth_m, live_head_boxes
         """
         t0 = time.perf_counter()
         self._last_frame = frame
         h, w = frame.shape[:2]
         self._last_frame_shape = frame.shape
         self._last_frame_width = w
+        self._object_escalation = None
 
-        yolo_boxes, yolo_kpts = self._yolo_detect(frame)
+        # ── Continuous SCUT-HEAD anchors ─────────────────────────────────
+        # Live heads move the locked anchors but never create, remove or
+        # renumber a seat.  The validation source merges the live boxes with
+        # any locked seat the current head pass missed, so a one-frame head
+        # miss cannot reject a genuine student.
+        live_heads = list(head_boxes or [])
+        self._last_live_head_boxes = [
+            dict(head) if isinstance(head, dict) else {"box": list(head)}
+            for head in live_heads
+        ]
+        live_seat_ids: list[str | None] = []
+        validation_heads: Any = self._seat_anchors
+        if live_heads and perf_config.ENABLE_LIVE_HEAD_ANCHORS:
+            if self._seat_anchors is not None:
+                live_seat_ids = self._seat_anchors.observe_live_heads(
+                    live_heads, self._frames_seen
+                )
+            validation_heads = []
+            matched_seats: set[str] = set()
+            for i, head in enumerate(live_heads):
+                box = head.get("box") if isinstance(head, dict) else head
+                if not box or len(box) != 4:
+                    continue
+                seat_id = live_seat_ids[i] if i < len(live_seat_ids) else None
+                if seat_id:
+                    matched_seats.add(seat_id)
+                validation_heads.append({
+                    "box": [int(v) for v in box],
+                    "seat_id": seat_id,
+                })
+            if self._seat_anchors is not None:
+                for anchor in self._seat_anchors.anchors:
+                    if anchor.seat_id not in matched_seats:
+                        validation_heads.append({
+                            "box": list(anchor.box),
+                            "seat_id": anchor.seat_id,
+                        })
+
+        # ByteTrack ids are a side effect of _yolo_detect: the method keeps
+        # its (boxes, keypoints) contract so existing stubs/tests stay valid.
+        self._last_track_ids = []
+        raw_boxes, raw_kpts = self._yolo_detect(frame)
+        track_ids = list(self._last_track_ids)
+        if len(track_ids) != len(raw_boxes):
+            # ByteTrack unavailable (or the detector was stubbed): the small
+            # IoU tracker still gives every candidate a stable id.
+            track_ids = self._candidate_tracker.update(raw_boxes, frame.shape)
+            self._last_track_ids = list(track_ids)
+
+        # Record presence BEFORE boundary validation.  A clipped candidate
+        # whose box is later rejected must still count as recently seen, or
+        # the next frame would falsely report P16 Absent Seat.
+        clip_info = self._clip_guard.update(
+            frame.shape, raw_boxes, track_ids, self._frames_seen
+        )
+
+        # Validate body hypotheses against the head anchors BEFORE spending
+        # MediaPipe inference on them.  This is the unified-cycle contract:
+        # SCUT-HEAD boxes gate the skeleton pass, not the other way round.
+        valid_indices: list[int] = []
+        validations: list[dict[str, Any]] = []
+        for i, box in enumerate(raw_boxes):
+            kp = raw_kpts[i] if i < len(raw_kpts) else None
+            validation = validate_candidate_boundaries(
+                box, kp, validation_heads
+            )
+            if validation["valid"]:
+                valid_indices.append(i)
+                validations.append(validation)
+
+        if len(valid_indices) != len(raw_boxes):
+            yolo_boxes = [raw_boxes[i] for i in valid_indices]
+            yolo_kpts = [raw_kpts[i] for i in valid_indices if i < len(raw_kpts)]
+            track_ids = [track_ids[i] for i in valid_indices]
+        else:
+            yolo_boxes, yolo_kpts = raw_boxes, raw_kpts
+        self._last_validations = validations
+
+        # MediaPipe runs only on the head-validated boxes.  When it returns
+        # one landmark set per box, mask face points that fall outside the
+        # matched SCUT head -- those belong to a neighbouring student.
         all_landmarks = self._mediapipe_landmarks(frame, yolo_boxes)
+        if len(all_landmarks) == len(yolo_boxes):
+            for landmarks, validation in zip(all_landmarks, validations):
+                head_box = validation.get("head_box")
+                if head_box:
+                    mask_face_outside_head(landmarks, head_box)
+
+        # Bind the surviving boxes to the classroom seats.  This is what
+        # keeps a partly clipped student attached to Seat_03 instead of being
+        # re-counted as a new candidate.
+        if self._seat_anchors is not None:
+            self._last_seat_ids = self._seat_anchors.bind(
+                yolo_boxes, track_ids, self._frames_seen
+            )
+        else:
+            self._last_seat_ids = [None] * len(yolo_boxes)
+        self._last_track_ids = list(track_ids)
+
+        # A genuine second student is still P35.  The same ByteTrack id, the
+        # same seat, or a near-identical duplicate box is one person.
+        person_count = self._clip_guard.distinct_person_count(
+            yolo_boxes, track_ids, self._last_seat_ids
+        )
+        presence_held = False
+        if (
+            person_count == 0
+            and self._clip_guard.presence_held(self._frames_seen)
+            and frame_has_usable_image(frame)
+        ):
+            # The candidate was here moments ago and is likely clipped out
+            # of the frame.  Hold the seat: P16 is an accusation, and it must
+            # not be manufactured by a boundary trim.
+            presence_held = True
+            person_count = 1
+        self._presence_held = presence_held
+        self._last_candidate_count = person_count
 
         # Capture the body context the desk-region and spatial-relation code
         # needs.  Shoulder width is the normalising scale throughout, so a
@@ -1241,6 +2017,13 @@ class PoseClassifier:
         self._last_person_bbox = list(yolo_boxes[0]) if yolo_boxes else None
         self._last_shoulder_width = (
             self._last_persons[0]["shoulder_w"] if self._last_persons else 0.0
+        )
+
+        # Metric depth for the primary candidate.  A failed solve is recorded
+        # explicitly rather than silently falling back to pixels: the live
+        # phone/reach verdicts below fail closed when ``depth_m`` is None.
+        self._last_depth_info = metric_depth.estimate_candidate_depth(
+            self._last_landmarks, frame.shape
         )
 
         # ── 3D Head Pose (dedicated estimator) ───────────────────────────
@@ -1319,7 +2102,12 @@ class PoseClassifier:
         spatial = self._compute_spatial_features(yolo_boxes, frame.shape)
 
         # ── Multi-candidate proximity vectoring ──────────────────────────
-        person_count = len(yolo_boxes)
+        # Distinct candidates after ByteTrack/seat/duplicate collapse, not
+        # raw boxes: a clipped duplicate must not become P35 Multiple Persons.
+        person_count = self._last_candidate_count
+        temporal_metrics["candidate_count"] = float(person_count)
+        temporal_metrics["presence_held"] = 1.0 if self._presence_held else 0.0
+        temporal_metrics["clip_guard"] = 1.0 if clip_info["any_clipped"] else 0.0
         anomalies_from_head = head_pose_result.get("anomalies", [])
 
         # ── Rule engine ──────────────────────────────────────────────────
@@ -1344,17 +2132,14 @@ class PoseClassifier:
         pose_id, confidence = raw_pose_id, raw_confidence
         if self._object_context_wanted(raw_pose_id, warming_up):
             objects_detected = self._detect_objects(frame, yolo_boxes)
-            # Escalate to P13 Note Peeking / P38 Unusual Object, but only for
-            # objects the student could actually be using.
-            pose_id, confidence = self._escalate_from_objects(
-                pose_id, confidence, objects_detected
-            )
 
         # ── Concurrent desk-object proximity fusion ─────────────────────
-        # The DeskProximityThread runs its own desk YOLO pass on candidate
-        # crops in parallel with this loop.  Its detections are merged with
-        # any the anomaly-triggered pass above produced, so the phone rule
-        # sees one list regardless of which pass saw the phone first.
+        # The DeskProximityThread runs its own desk YOLO pass on a throttled
+        # 416 px desk ROI in parallel with this loop.  Its detections are
+        # merged with any the anomaly-triggered pass above produced, so the
+        # phone/object rules see one list regardless of which pass saw the
+        # object first.  A proximity-only detection can escalate on a P01
+        # frame -- that is the whole point of running it concurrently.
         proximity_snapshot = self._proximity
         phone_hit: dict[str, Any] | None = None
         if proximity_snapshot:
@@ -1363,15 +2148,53 @@ class PoseClassifier:
             )
             if merged_objects is not objects_detected:
                 objects_detected = merged_objects
+
+        # Convert every device detection into metric camera coordinates before
+        # any rule reads it.  The annotation rewrites ``relation``/``in_hand``
+        # from pixels, so escalation and the neutral "device at jaw" test all
+        # agree on the 15 cm physical radius.
+        if objects_detected:
+            metric_depth.annotate_metric_distances(
+                objects_detected,
+                self._last_landmarks,
+                self._last_depth_info,
+                frame.shape,
+            )
+
+        if objects_detected and not warming_up:
+            # Devices must clear the metric 0.15 m wrist gate (confidence and
+            # temporal persistence included) before they can escalate.  The
+            # shared ObjectContext still decides reachability and the
+            # authorized/unauthorized document zones.
+            escalatable = [
+                obj for obj in objects_detected
+                if self._device_evidence_ok(obj, require_wrist=True)
+            ]
+            pose_id, confidence = self._escalate_from_objects(
+                pose_id, confidence, escalatable,
+                person_bbox=primary_bbox,
+                frame_shape=frame.shape,
+            )
+
+        if proximity_snapshot:
             phone_hit = self._phone_proximity_hit(objects_detected)
-            if phone_hit is None:
-                phone_hit = proximity_snapshot.get("phone")
+            snapshot_phone = proximity_snapshot.get("phone")
+            if phone_hit is None and self._proximity_snapshot_phone_usable(
+                snapshot_phone
+            ):
+                phone_hit = dict(snapshot_phone)  # type: ignore[arg-type]
         if phone_hit is not None:
             # Usability, not mere presence: the wrist must be AT the phone
             # and the detection must be confident.  Held to the stability
             # gate like every other anomaly below.
             pose_id = "P31_PHONE_USABILITY"
             confidence = max(confidence, 0.85)
+            self._object_escalation = {
+                "pose_id": "P31_PHONE_USABILITY",
+                "confidence": confidence,
+                "label": phone_hit.get("label"),
+                "reason": "wrist_proximity",
+            }
         elif self._earbuds_worn_hit(objects_detected):
             # Worn, not merely present: the earbud bbox must sit at an ear
             # landmark.  Same design as the phone-usability rule -- the
@@ -1389,7 +2212,12 @@ class PoseClassifier:
         # _NEUTRAL_SUPPRESSES) -- the first minute is benign, the next hour
         # is disengagement, and both are real findings.
         cheek_elapsed = self._temporal_buffer.update_cheek_contact(
-            _cheek_contact_active(self._last_landmarks, objects_detected),
+            _cheek_contact_active(
+                self._last_landmarks,
+                objects_detected,
+                self._last_depth_info,
+                frame.shape,
+            ),
             time.monotonic(),
         )
 
@@ -1407,6 +2235,8 @@ class PoseClassifier:
                 objects_detected,
                 bbox=list(primary_bbox) if primary_bbox else None,
                 temporal=self._temporal_buffer,
+                depth_info=self._last_depth_info,
+                frame_shape=frame.shape,
             )
         if neutral_state is not None and pose_id in _NEUTRAL_SUPPRESSES:
             temporal_metrics["neutral_suppressed"] = 1.0
@@ -1484,17 +2314,45 @@ class PoseClassifier:
             confidence = min(confidence + 0.10, 0.99)
 
         # ── Optional ML classifier override ──────────────────────────────
+        # ---- Optional ML classifier override ----
+        # The model consumes the same 54-D vector that DatasetLogger writes.
+        # A missing keypoint stays NaN so the saved imputer sees the same
+        # distribution it saw during training.
         if self._ml_classifier is not None and features and not warming_up:
-            ml_pose_id, ml_conf = self._ml_predict(features)
+            # The rule engine treats a failed PnP solve as zero-angle, but the
+            # training CSV stores those angles as NaN.  Feed the model the
+            # training distribution; leave ``head_pose`` itself untouched so
+            # rule/temporal behaviour does not change.
+            ml_head_pose = head_pose
+            if head_pose_result.get("rvec") is None:
+                ml_head_pose = {
+                    "yaw": float("nan"),
+                    "pitch": float("nan"),
+                    "roll": float("nan"),
+                }
+            ml_features = feature_dict_from_components(
+                keypoints=yolo_kpts[0] if yolo_kpts else None,
+                bbox=yolo_boxes[0] if yolo_boxes else None,
+                head_pose=ml_head_pose,
+                geometric=features,
+                spatial=spatial,
+                motion_delta=temporal_metrics.get("bbox_scale_delta", 0.0),
+            )
+            ml_pose_id, ml_conf = self._ml_predict(ml_features)
             if ml_conf > 0.80:
+                # A pose-only classifier must not overturn room-level or
+                # object-level facts (absence, occupancy, phone, documents).
+                if pose_id in _PRESENCE_POSES or ml_pose_id in _ML_OBJECT_VERDICTS:
+                    temporal_metrics["ml_blocked"] = 1.0
                 # The neutral filter is a promise that these specific alerts
                 # stay down while benign behaviour is being demonstrated; an
                 # ML override must not be able to sneak them back in.
-                if neutral_state is not None and ml_pose_id in _NEUTRAL_SUPPRESSES:
+                elif neutral_state is not None and ml_pose_id in _NEUTRAL_SUPPRESSES:
                     temporal_metrics["neutral_suppressed"] = 1.0
                 else:
                     pose_id, confidence = ml_pose_id, ml_conf
 
+        seat_info = self.seat_anchor_info()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if elapsed_ms > perf_config.WARN_THRESHOLD_MS:
             # Rate-limit: warn periodically rather than on every frame, so a
@@ -1523,6 +2381,36 @@ class PoseClassifier:
             "anomalies": anomalies_from_head,
             "anomaly_flags": self._build_flags(pose_id),
             "objects_detected": objects_detected,
+            # solvePnP camera-frame estimate for the primary candidate.  A
+            # None depth means no metric verdict this frame (never pixels).
+            "candidate_depth_m": self._last_depth_info.get("depth_m"),
+            "candidate_position_m": self._last_depth_info.get("position_m"),
+            "depth_method": self._last_depth_info.get("method", ""),
+            "depth_reprojection_px": self._last_depth_info.get(
+                "reprojection_error_px"
+            ),
+            # Live SCUT-HEAD boxes used to gate this frame's skeletons, plus
+            # the per-candidate boundary decision (head anchor, seat, limb
+            # attribution) for the sidebar/debug overlay.
+            "live_head_boxes": list(self._last_live_head_boxes),
+            "head_anchor_validations": [dict(v) for v in validations],
+            # Classroom continuity: the ByteTrack ids, the seat each candidate
+            # resolved to, and the locked seat inventory established during
+            # startup.  The HUD draws one label per box from these.
+            "track_ids": list(self._last_track_ids),
+            "seat_ids": list(self._last_seat_ids),
+            "seat_anchors": seat_info["seat_anchors"],
+            "seated_count": seat_info["seated_count"],
+            "seats_locked": seat_info["seats_locked"],
+            "candidate_count": int(self._last_candidate_count),
+            "presence_held": bool(self._presence_held),
+            # Which object (if any) escalated the verdict, for the sidebar and
+            # dataset logs.  None on frames with no object evidence.
+            "object_escalation": (
+                dict(self._object_escalation)
+                if self._object_escalation is not None
+                else None
+            ),
             # Positive neutral posture filter output.  The label is resolved
             # here so the HUD and sidebar never have to import NEUTRAL_LABELS
             # to render a state.
@@ -1536,6 +2424,9 @@ class PoseClassifier:
                 {
                     "label": phone_hit.get("label"),
                     "confidence": phone_hit.get("confidence"),
+                    "wrist_dist_m": phone_hit.get("wrist_dist_m"),
+                    # Retained for the HUD's legacy debug read; metric code
+                    # must use wrist_dist_m.
                     "wrist_dist": phone_hit.get("wrist_dist"),
                 }
                 if phone_hit is not None
@@ -1550,22 +2441,65 @@ class PoseClassifier:
     def _yolo_detect(
         self, frame: np.ndarray
     ) -> tuple[list[list[int]], list[np.ndarray]]:
+        """Run pose detection and, when available, ByteTrack id assignment.
+
+        The return contract stays ``(boxes, keypoints)`` because callers and
+        tests stub this method with that shape.  Track ids are published as a
+        side effect in ``self._last_track_ids``; classify() falls back to its
+        own IoU tracker when they are missing or misaligned.
+        """
         if self._yolo is None:
+            self._last_track_ids = []
             return ([], [])
+
+        use_track = (
+            bool(perf_config.ENABLE_BYTETRACK) and not self._bytetrack_failed
+        )
+        kwargs = dict(
+            imgsz=perf_config.POSE_IMGSZ,
+            max_det=perf_config.POSE_MAX_DET,
+            device=self._device_arg,
+            quantize=16 if self._half else None,
+            verbose=False,
+        )
         try:
-            results = self._yolo(
-                frame,
-                imgsz=perf_config.POSE_IMGSZ,
-                max_det=perf_config.POSE_MAX_DET,
-                device=self._device_arg,
-                quantize=16 if self._half else None,
-                verbose=False,
-            )
+            if use_track:
+                try:
+                    results = self._yolo.track(
+                        frame,
+                        persist=True,
+                        tracker=perf_config.BYTETRACK_CONFIG,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    # A missing/invalid tracker config must not disable pose
+                    # detection: remember the failure and use the plain
+                    # detector plus the IoU fallback tracker from now on.
+                    self._bytetrack_failed = True
+                    logger.warning(
+                        "ByteTrack unavailable (%s); using IoU tracker", exc
+                    )
+                    results = self._yolo(frame, **kwargs)
+            else:
+                results = self._yolo(frame, **kwargs)
             r = results[0]
             boxes = (
                 r.boxes.xyxy.cpu().numpy().tolist()
                 if r.boxes is not None
                 else []
+            )
+            ids: list[int] = []
+            if use_track and r.boxes is not None:
+                raw_ids = getattr(r.boxes, "id", None)
+                if raw_ids is not None:
+                    try:
+                        ids = [
+                            int(v) for v in raw_ids.cpu().numpy().tolist()
+                        ]
+                    except (AttributeError, TypeError, ValueError):
+                        ids = []
+            self._last_track_ids = (
+                ids if ids and len(ids) == len(boxes) else []
             )
             kpts = (
                 r.keypoints.data.cpu().numpy()
@@ -1575,11 +2509,36 @@ class PoseClassifier:
             return boxes, list(kpts) if kpts.ndim == 3 else []
         except Exception as exc:
             logger.error("YOLO detection failed: %s", exc)
+            self._last_track_ids = []
             return ([], [])
 
     # ------------------------------------------------------------------
     # MediaPipe PoseLandmarker (Task API)
     # ------------------------------------------------------------------
+
+    def _mp_rgb_crop(self, crop: np.ndarray) -> np.ndarray | None:
+        """BGR crop -> reusable contiguous RGB buffer (or None if empty)."""
+        if crop.size == 0 or crop.ndim != 3 or crop.shape[2] != 3:
+            return None
+        height, width = crop.shape[:2]
+        if height <= 0 or width <= 0:
+            return None
+        buffer = self._mp_rgb_buffers.get(width)
+        if buffer is None or buffer.shape[0] < height:
+            # Keep the cache bounded.  Widths come from candidate boxes; a
+            # handful of stable widths covers a classroom, and evicting the
+            # oldest entry prevents a moving camera from growing it forever.
+            if len(self._mp_rgb_buffers) >= 8:
+                self._mp_rgb_buffers.pop(next(iter(self._mp_rgb_buffers)))
+            buffer = np.empty(
+                (max(height, 64), width, 3), dtype=np.uint8
+            )
+            self._mp_rgb_buffers[width] = buffer
+        # Width matches the buffer exactly, so this row-prefix view is
+        # C-contiguous (height may be smaller than the allocation).
+        view = buffer[:height]
+        cv2.cvtColor(crop, cv2.COLOR_BGR2RGB, dst=view)
+        return view
 
     def _mediapipe_landmarks(
         self,
@@ -1606,16 +2565,14 @@ class PoseClassifier:
             # Convert only the crop to RGB.  Converting the whole frame first
             # (as this previously did) is pure waste: on a 1280x720 CCTV feed
             # that is ~2.7 MB of extra conversion per frame, per person.
-            crop = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
-            if crop.size == 0:
+            #
+            # The destination is a reusable, exactly-width buffer.  MediaPipe
+            # requires C-contiguous input; a strided view makes it silently
+            # return zero poses (no error, no warning), which quietly disables
+            # the entire P01-P40 rule engine downstream.
+            crop = self._mp_rgb_crop(frame[y1:y2, x1:x2])
+            if crop is None or crop.size == 0:
                 continue
-
-            # MediaPipe requires C-contiguous input.  Feeding it a strided
-            # numpy view makes it silently return zero poses (no error, no
-            # warning), which quietly disables the entire P01-P40 rule
-            # engine downstream.  Guarantee contiguity explicitly.
-            if not crop.flags["C_CONTIGUOUS"]:
-                crop = np.ascontiguousarray(crop)
 
             mp_img = self._mp_image_cls(
                 image_format=self._mp_image_format, data=crop
@@ -1741,7 +2698,9 @@ class PoseClassifier:
         # ratios, and rules that fire on "too small" (e.g. hand-to-mouth)
         # would then trigger on every unmeasurable frame.  That previously
         # mislabelled the majority of frames as P19.
-        features: dict[str, float] = {name: float("nan") for name in FEATURE_NAMES}
+        features: dict[str, float] = {
+            name: float("nan") for name in GEOMETRIC_FEATURE_NAMES
+        }
 
         if not landmarks or len(landmarks) < 33:
             return features
@@ -1883,19 +2842,55 @@ class PoseClassifier:
     # scikit-learn ML prediction
     # ------------------------------------------------------------------
 
-    def _ml_predict(self, features: dict[str, float]) -> tuple[str, float]:
+    def _ml_predict(
+        self, features: dict[str, float] | np.ndarray
+    ) -> tuple[str, float]:
+        """Predict a verdict from the canonical 54-D feature vector.
+
+        Missing values stay NaN: the saved pipeline owns a median imputer, and
+        imputing here with 0.0 would silently disagree with training.
+        """
         try:
-            # NaN (unmeasured) is coalesced to 0.0 here: the sklearn pipeline
-            # was fitted on fully-measured rows and has no NaN handling.
-            vector = np.array(
-                [[_feature_or_zero(features, name) for name in FEATURE_NAMES]]
-            )
-            prediction = self._ml_classifier.predict(vector)[0]
-            pose_id = str(prediction)
-            confidence = 0.85
+            if isinstance(features, dict):
+                vector = vector_from_dict(features).reshape(1, -1)
+            else:
+                vector = np.asarray(features, dtype=np.float64).reshape(1, -1)
+
+            expected = len(self._ml_feature_names or FEATURE_NAMES)
+            if vector.shape[1] != expected:
+                raise ValueError(
+                    f"expected {expected} features, got {vector.shape[1]}"
+                )
+
+            # One traversal, not two.  Calling predict() and then
+            # predict_proba() walked all 200 trees twice; at 10 FPS that was
+            # ~90 ms of avoidable per-frame latency.  Derive the label from
+            # the probability vector when the estimator supports it.
             if hasattr(self._ml_classifier, "predict_proba"):
-                proba = self._ml_classifier.predict_proba(vector)[0]
-                confidence = float(np.max(proba))
+                proba = np.asarray(
+                    self._ml_classifier.predict_proba(vector)
+                ).reshape(-1)
+                if not proba.size:
+                    raise ValueError("empty predict_proba output")
+                classes = getattr(self._ml_classifier, "classes_", None)
+                if classes is None and hasattr(
+                    self._ml_classifier, "named_steps"
+                ):
+                    final = list(self._ml_classifier.named_steps.values())[-1]
+                    classes = getattr(final, "classes_", None)
+                best = int(np.argmax(proba))
+                if classes is not None and best < len(classes):
+                    pose_id = str(np.asarray(classes)[best])
+                else:
+                    pose_id = str(self._ml_classifier.predict(vector)[0])
+                confidence = float(proba[best])
+            else:
+                pose_id = str(self._ml_classifier.predict(vector)[0])
+                confidence = 0.85
+
+            if pose_id not in POSE_MAP and pose_id != "P00":
+                logger.debug("ML predicted unknown verdict %r", pose_id)
+                return ("P01", 0.0)
             return pose_id, confidence
         except Exception as exc:
             logger.debug("ML prediction failed: %s", exc)
@@ -1986,13 +2981,25 @@ class PoseClassifier:
     def _escalate_from_objects(
         self, pose_id: str, confidence: float,
         objects: list[dict[str, Any]],
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
     ) -> tuple[str, float]:
         """Escalate a verdict using detected objects, with spatial agreement.
 
-        Delegates to ObjectContext.escalate: which labels escalate and where
-        the spatial gate sits are configuration, shared with the backend.
+        Delegates to ObjectContext.escalation_detail: which labels escalate,
+        where the spatial gate sits, and which documents are authorized are
+        configuration, shared with the backend.  ``person_bbox``/``frame_shape``
+        are optional so the legacy three-argument calls (and their tests)
+        keep working; the live path supplies them so unauthorized documents
+        can be tested against the candidate's designated desk zone.
         """
-        return ObjectContext.escalate(pose_id, confidence, objects)
+        detail = ObjectContext.escalation_detail(
+            objects, person_bbox, frame_shape
+        )
+        if detail is None:
+            return pose_id, confidence
+        self._object_escalation = dict(detail)
+        return detail["pose_id"], max(confidence, float(detail["confidence"]))
 
     # ------------------------------------------------------------------
     # P01-P40 rule engine

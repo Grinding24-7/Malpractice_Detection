@@ -195,8 +195,14 @@ def main() -> int:
     print("4. classify(): P31_PHONE_USABILITY suppressed by writing")
     c2 = PoseClassifier()
     c2._frames_seen = perf_config.WARMUP_FRAMES
-    phone = {"label": "cell_phone", "confidence": 0.8,
-             "box": [240, 480, 270, 520]}
+    phone = {
+        "label": "cell_phone", "confidence": 0.8,
+        "box": [240, 480, 270, 520],
+        # The proximity verdict now requires temporal persistence (re-sighted
+        # on PROX_MIN_HITS throttled passes) and a measured metric distance.
+        "hits": perf_config.PROX_MIN_HITS, "wrist_dist_m": 0.05,
+        "persistent": True,
+    }
     c2.set_proximity({"objects": [phone], "phone": phone,
                       "ts": time.time()})
     results = []
@@ -275,13 +281,18 @@ def main() -> int:
                     ctx.is_custom is False)
         ok &= check("class map fell back to COCO subset",
                     set(ctx.class_map.values()) == {"book", "cell_phone", "laptop"})
-    ok &= check("proximity throttle is 416 px / 1-in-3 frames",
+    ok &= check("proximity throttle is 416 px / 1-in-8 frames",
                 perf_config.OBJ_IMGSZ == 416
-                and perf_config.PROX_EVERY_N_FRAMES == 3,
+                and perf_config.PROX_EVERY_N_FRAMES == 8,
                 f"imgsz={perf_config.OBJ_IMGSZ} every_n={perf_config.PROX_EVERY_N_FRAMES}")
-    ok &= check("phone thresholds are 120 px / conf > 0.6",
-                perf_config.PHONE_WRIST_DIST_PX == 120.0
-                and perf_config.PHONE_MIN_CONF == 0.6)
+    ok &= check("proximity persistence requires 3 hits",
+                perf_config.PROX_MIN_HITS == 3,
+                f"got {perf_config.PROX_MIN_HITS}")
+    ok &= check("phone threshold is metric 0.15 m / conf > 0.6",
+                perf_config.PHONE_WRIST_DIST_M == 0.15
+                and perf_config.PHONE_MIN_CONF == 0.6,
+                f"metric={perf_config.PHONE_WRIST_DIST_M} "
+                f"px={perf_config.PHONE_WRIST_DIST_PX}")
 
     # ── 8. DeskProximityThread: non-blocking handoff ───────────────────
     print()

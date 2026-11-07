@@ -33,6 +33,13 @@ from typing import Any
 import numpy as np
 
 from desktop_app.core import perf_config
+from desktop_app.core.torch_compile_utils import install_safe_compile
+from desktop_app.core.vision_utils import (
+    LetterboxBuffer,
+    configure_opencv_threads,
+    letterbox_square,
+    unletterbox_box,
+)
 
 try:
     from backend.runtime import optimize_cuda, resolve_device, yolo_device
@@ -114,6 +121,113 @@ def box_iou(a: list[int], b: list[int]) -> float:
     area_a = max(1, (a[2] - a[0]) * (a[3] - a[1]))
     area_b = max(1, (b[2] - b[0]) * (b[3] - b[1]))
     return inter / float(area_a + area_b - inter)
+
+
+def box_overlap_fraction(inner: list[int], outer: list[int]) -> float:
+    """Fraction of *inner*'s area that falls inside *outer*.
+
+    Used for the document desk-zone test: a notebook merely touching the
+    zone boundary is not "on the desk", while one substantially inside it is.
+    """
+    if not inner or not outer or len(inner) != 4 or len(outer) != 4:
+        return 0.0
+    ix1, iy1 = max(inner[0], outer[0]), max(inner[1], outer[1])
+    ix2, iy2 = min(inner[2], outer[2]), min(inner[3], outer[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area = max(1.0, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return inter / area
+
+
+def desk_region_for(
+    frame_shape: tuple[int, ...],
+    person_bbox: list[int] | None = None,
+    shoulder_w: float = 0.0,
+    *,
+    top_ratio: float | None = None,
+    lateral_shoulder_widths: float | None = None,
+    force_narrow: bool = False,
+) -> tuple[int, int, int, int]:
+    """Desk search region ``(x1, y1, x2, y2)`` for one frame.
+
+    Shared by the anomaly-triggered desk pass and the concurrent proximity
+    pass.  With ``force_narrow`` the region is the desk band around the
+    candidate even when that band covers less than three quarters of the
+    frame -- the proximity thread wants one student's desk, not the whole
+    classroom.
+    """
+    frame_h, frame_w = frame_shape[:2]
+    top = (
+        perf_config.OBJ_REGION_TOP_RATIO
+        if top_ratio is None else float(top_ratio)
+    )
+    lateral = (
+        perf_config.OBJ_LATERAL_SHOULDER_WIDTHS
+        if lateral_shoulder_widths is None
+        else float(lateral_shoulder_widths)
+    )
+    y1 = int(frame_h * top)
+    x1, x2 = 0, frame_w
+
+    if person_bbox is not None and len(person_bbox) == 4:
+        bx1, _, bx2, _ = person_bbox
+        box_w = max(1.0, float(bx2 - bx1))
+        centre = (bx1 + bx2) / 2.0
+        half = max(lateral * shoulder_w if shoulder_w else 0.0, box_w / 2.0)
+        narrowed_x1 = int(max(0.0, centre - half))
+        narrowed_x2 = int(min(float(frame_w), centre + half))
+        if force_narrow or (narrowed_x2 - narrowed_x1) > 0.75 * frame_w:
+            x1, x2 = narrowed_x1, narrowed_x2
+
+    x1 = max(0, min(x1, frame_w - 1))
+    x2 = max(x1 + 1, min(x2, frame_w))
+    y1 = max(0, min(y1, frame_h - 1))
+    y2 = max(y1 + 1, frame_h)
+    return x1, y1, x2, y2
+
+
+def desk_zone_for(
+    person_bbox: list[int] | None,
+    frame_shape: tuple[int, ...] | None,
+) -> tuple[int, int, int, int] | None:
+    """Designated desk space for one candidate, or None without geometry."""
+    if person_bbox is None or len(person_bbox) != 4 or frame_shape is None:
+        return None
+    frame_h, frame_w = frame_shape[:2]
+    x1, y1, x2, y2 = (float(v) for v in person_bbox)
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    zone_x1 = int(max(0.0, x1 - perf_config.OBJ_DESK_ZONE_LATERAL_EXPAND * bw))
+    zone_x2 = int(min(float(frame_w),
+                      x2 + perf_config.OBJ_DESK_ZONE_LATERAL_EXPAND * bw))
+    zone_y1 = int(max(0.0, y1 + perf_config.OBJ_DESK_ZONE_TOP_RATIO * bh))
+    zone_y2 = int(min(float(frame_h),
+                      y2 + perf_config.OBJ_DESK_ZONE_BOTTOM_EXPAND * bh))
+    if zone_x2 <= zone_x1 or zone_y2 <= zone_y1:
+        return None
+    return zone_x1, zone_y1, zone_x2, zone_y2
+
+
+def wrist_distance_px(
+    obj_box: list[int],
+    landmarks: list[tuple[float, float, float]] | None,
+) -> float | None:
+    """Raw pixel distance from an object's centre to the nearest wrist."""
+    if not obj_box or len(obj_box) != 4 or not landmarks:
+        return None
+    if len(landmarks) <= MP_RIGHT_WRIST:
+        return None
+    cx = (obj_box[0] + obj_box[2]) / 2.0
+    cy = (obj_box[1] + obj_box[3]) / 2.0
+    best = float("inf")
+    for idx in (MP_LEFT_WRIST, MP_RIGHT_WRIST):
+        x, y, vis = landmarks[idx]
+        if vis is None or vis <= 0.5:
+            continue
+        dist = ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5
+        best = min(best, dist)
+    return None if best == float("inf") else float(best)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +321,8 @@ class ObjectContext:
         self.person_bbox: list[int] | None = None
         self.shoulder_w: float = 0.0
         self.landmarks: list[tuple[float, float, float]] | None = None
+        configure_opencv_threads()
+        self._letterbox_buffer = LetterboxBuffer(perf_config.OBJ_IMGSZ)
 
     # -- model ------------------------------------------------------------
 
@@ -259,6 +375,7 @@ class ObjectContext:
 
         self.model = model
         self.model_path = str(path)
+        install_safe_compile(model, "desk")
         if is_custom:
             self.class_map = adopt_custom_classes(model)
             self.is_custom = True
@@ -367,31 +484,40 @@ class ObjectContext:
         overhead-mount CCTV view, narrowing to a band around the subject only
         when a very wide scene would otherwise waste detection on empty floor.
         """
-        frame_h, frame_w = frame_shape[:2]
-        y1 = int(frame_h * perf_config.OBJ_REGION_TOP_RATIO)
-        x1, x2 = 0, frame_w
+        return desk_region_for(
+            frame_shape,
+            self.person_bbox,
+            self.shoulder_w,
+        )
 
-        box = self.person_bbox
-        if box is not None:
-            shoulder_w = self.shoulder_w
-            if shoulder_w and shoulder_w > 0:
-                bx1, _, bx2, _ = box
-                centre = (bx1 + bx2) / 2.0
-                half = max(
-                    perf_config.OBJ_LATERAL_SHOULDER_WIDTHS * shoulder_w,
-                    (bx2 - bx1) / 2.0,
-                )
-                narrowed_x1 = int(max(0.0, centre - half))
-                narrowed_x2 = int(min(float(frame_w), centre + half))
-                # Only adopt the narrower band if it keeps most of the frame.
-                if (narrowed_x2 - narrowed_x1) > 0.75 * frame_w:
-                    x1, x2 = narrowed_x1, narrowed_x2
+    def desk_zone(
+        self,
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
+    ) -> tuple[int, int, int, int] | None:
+        """The candidate's designated desk space for document checks.
 
-        x1 = max(0, min(x1, frame_w - 1))
-        x2 = max(x1 + 1, min(x2, frame_w))
-        y1 = max(0, min(y1, frame_h - 1))
-        y2 = max(y1 + 1, frame_h)
-        return x1, y1, x2, y2
+        Starts below the torso (a document held to the chest is a different
+        finding), extends laterally past the body, and reaches slightly below
+        the person box to include the desk edge nearest the camera.
+        """
+        box = person_bbox if person_bbox is not None else self.person_bbox
+        shape = frame_shape or self.frame_shape
+        return desk_zone_for(box, shape)
+
+    def document_in_desk_zone(
+        self,
+        obj_box: list[int],
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
+    ) -> bool:
+        """True when an unauthorized document overlaps >50% of the desk zone."""
+        zone = self.desk_zone(person_bbox, frame_shape)
+        if zone is None:
+            return False
+        return box_overlap_fraction(obj_box, list(zone)) > (
+            perf_config.OBJ_DOC_ZONE_MIN_OVERLAP
+        )
 
     def classify_relation(
         self,
@@ -581,6 +707,7 @@ class ObjectContext:
                 "relation": det.get("relation", "away"),
                 "in_hand": det.get("in_hand", False),
                 "reachable": det.get("reachable", False),
+                "wrist_dist_px": det.get("wrist_dist_px"),
                 "persistent": True,
             })
             used_dets.add(di)
@@ -597,6 +724,7 @@ class ObjectContext:
                 "relation": det.get("relation", "away"),
                 "in_hand": det.get("in_hand", False),
                 "reachable": det.get("reachable", False),
+                "wrist_dist_px": det.get("wrist_dist_px"),
                 "last_seen": now,
                 "persistent": False,
             })
@@ -616,6 +744,7 @@ class ObjectContext:
                     "relation": track["relation"],
                     "in_hand": track["in_hand"],
                     "reachable": track["reachable"],
+                    "wrist_dist_px": track.get("wrist_dist_px"),
                     # Frames the object has been absent for, so a caller can
                     # tell a fresh detection from a remembered one.
                     "age_frames": now - track["last_seen"],
@@ -660,11 +789,17 @@ class ObjectContext:
         if crop.size == 0:
             return self.merge_tracks([])
 
+        size = int(imgsz if imgsz is not None else perf_config.OBJ_IMGSZ)
+        if self._letterbox_buffer.size == size:
+            canvas, scale, pad_x, pad_y = self._letterbox_buffer.apply(crop)
+        else:
+            canvas, scale, pad_x, pad_y = letterbox_square(crop, size)
+
         fresh: list[dict[str, Any]] = []
         try:
             results = self.model(
-                crop,
-                imgsz=imgsz if imgsz is not None else perf_config.OBJ_IMGSZ,
+                canvas,
+                imgsz=size,
                 conf=conf if conf is not None else perf_config.OBJ_CONF_THRESHOLD,
                 device=self.device_arg,
                 quantize=16 if self.half else None,
@@ -680,12 +815,16 @@ class ObjectContext:
                     if det_cls not in self.class_map:
                         continue
                     # Offset crop coordinates back to full frame.
-                    full_box = [
-                        int(det_box[0]) + rx1,
-                        int(det_box[1]) + ry1,
-                        int(det_box[2]) + rx1,
-                        int(det_box[3]) + ry1,
-                    ]
+                    full_box = unletterbox_box(
+                        det_box,
+                        scale,
+                        pad_x,
+                        pad_y,
+                        offset_x=rx1,
+                        offset_y=ry1,
+                        frame_width=frame.shape[1],
+                        frame_height=frame.shape[0],
+                    )
                     det = {
                         "label": self.class_map[det_cls],
                         "confidence": float(det_conf),
@@ -694,7 +833,19 @@ class ObjectContext:
                     # Attribute to the nearest person, not to whoever was
                     # detected first: on a shared desk the nearest student is
                     # the one whose hands could plausibly be on the object.
-                    det.update(self.relation_to_nearest_person(full_box))
+                    relation = self.relation_to_nearest_person(full_box)
+                    det.update(relation)
+                    # Raw pixel wrist distance for the live device gate.  The
+                    # shared relation distance is shoulder-normalised (right
+                    # for reach); phone-use also needs the explicit 120 px
+                    # "hand is on it" test.
+                    person_lms = self.landmarks
+                    idx = relation.get("person_index")
+                    if idx is not None and 0 <= int(idx) < len(self.persons):
+                        person_lms = self.persons[int(idx)].get("landmarks")
+                    det["wrist_dist_px"] = wrist_distance_px(
+                        full_box, person_lms
+                    )
                     fresh.append(det)
         except Exception as exc:
             logger.debug("Object detection failed: %s", exc)
@@ -703,9 +854,98 @@ class ObjectContext:
 
     # -- escalation --------------------------------------------------------
 
+    @classmethod
+    def escalation_detail(
+        cls,
+        objects: list[dict[str, Any]],
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
+    ) -> dict[str, Any] | None:
+        """Full escalation decision, including which object caused it.
+
+        Returns ``{"pose_id", "confidence", "label", "reason"}`` or None.
+
+        Two different gates apply:
+
+        * devices/books use the spatial relation gate (in hand / within
+          reach), unchanged from the backend contract;
+        * unauthorized documents (notebook, scratch paper, a stack) use the
+          candidate's designated desk zone instead.  A notebook in a bag on
+          the floor is not evidence; one opened on the desk is.  The document
+          must overlap *more than 50%* of that zone -- a box merely touching
+          the boundary does not clear the gate.  Venue documents (answer
+          sheet, exam booklet, exam paper) are explicitly excluded and can
+          never escalate.
+        """
+        if not objects:
+            return None
+
+        require_spatial = perf_config.OBJ_REQUIRE_SPATIAL_AGREEMENT
+
+        for obj in objects:
+            label = str(obj.get("label", "")).lower()
+            conf = float(obj.get("confidence", 0.0))
+            if conf < perf_config.OBJ_SPATIAL_MIN_CONFIDENCE:
+                continue
+
+            # Venue-issued documents are always benign.
+            if label in perf_config.OBJ_AUTHORIZED_DOCUMENT_CLASSES:
+                continue
+
+            if label in perf_config.OBJ_UNAUTHORIZED_DOCUMENT_CLASSES:
+                target = perf_config.OBJ_DOC_ZONE_ESCALATE_TO.get(label)
+                if target is None:
+                    continue
+                zone = cls.desk_zone_for(person_bbox, frame_shape)
+                if zone is None:
+                    continue
+                # Strict majority: exactly 50% does not clear the gate.
+                if not (
+                    box_overlap_fraction(obj.get("box") or [], list(zone))
+                    > perf_config.OBJ_DOC_ZONE_MIN_OVERLAP
+                ):
+                    continue
+                return {
+                    "pose_id": target[0],
+                    "confidence": target[1],
+                    "label": label,
+                    "reason": "document_zone",
+                }
+
+            if require_spatial:
+                # Either the student is holding it, or it is within reach.
+                # Both are necessary: without reach, a phone across the room
+                # says nothing; without confidence, a fuzzy box near a wrist
+                # says nothing.
+                if not (obj.get("in_hand") or obj.get("reachable")):
+                    continue
+
+            escalation = perf_config.OBJ_ESCALATE_TO.get(label)
+            if escalation is None:
+                continue
+            return {
+                "pose_id": escalation[0],
+                "confidence": escalation[1],
+                "label": label,
+                "reason": "spatial",
+            }
+
+        return None
+
     @staticmethod
+    def desk_zone_for(
+        person_bbox: list[int] | None,
+        frame_shape: tuple[int, ...] | None,
+    ) -> tuple[int, int, int, int] | None:
+        """Desk zone without an instance (used by the class-level escalation)."""
+        return desk_zone_for(person_bbox, frame_shape)
+
+    @classmethod
     def escalation(
-        objects: list[dict[str, Any]]
+        cls,
+        objects: list[dict[str, Any]],
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
     ) -> tuple[str, float] | None:
         """``(verdict, confidence_floor)`` if *objects* warrant a finding.
 
@@ -718,47 +958,31 @@ class ObjectContext:
         flag rather than reporting a pose id, and needs the same decision
         without inventing a sentinel verdict to compare against.
         """
-        if not objects:
+        detail = cls.escalation_detail(objects, person_bbox, frame_shape)
+        if detail is None:
             return None
-
-        require_spatial = perf_config.OBJ_REQUIRE_SPATIAL_AGREEMENT
-
-        for obj in objects:
-            conf = obj["confidence"]
-            if conf < perf_config.OBJ_SPATIAL_MIN_CONFIDENCE:
-                continue
-
-            if require_spatial:
-                # Either the student is holding it, or it is within reach.
-                # Both are necessary: without reach, a phone across the room
-                # says nothing; without confidence, a fuzzy box near a wrist
-                # says nothing.
-                if not (obj.get("in_hand") or obj.get("reachable")):
-                    continue
-
-            escalation = perf_config.OBJ_ESCALATE_TO.get(obj["label"])
-            if escalation is None:
-                continue
-            return escalation
-
-        return None
+        return detail["pose_id"], detail["confidence"]
 
     @classmethod
     def escalate(
-        cls, pose_id: str, confidence: float, objects: list[dict[str, Any]]
+        cls,
+        pose_id: str,
+        confidence: float,
+        objects: list[dict[str, Any]],
+        person_bbox: list[int] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
     ) -> tuple[str, float]:
         """Escalate a verdict using detected objects, with spatial agreement.
 
         A detection must clear the spatial gate (unless
         ``OBJ_REQUIRE_SPATIAL_AGREEMENT`` is disabled for comparison) AND be a
         label configured to escalate.  Which labels escalate is configuration
-        rather than code, because a custom desk model names 13 classes and
+        rather than code, because a custom desk model names 16 classes and
         each one needs a decision; anything unmapped (paper, pen, calculator)
         is displayed but never escalates -- holding exam paper is an exam,
         not a finding.
         """
-        hit = cls.escalation(objects)
-        if hit is None:
+        detail = cls.escalation_detail(objects, person_bbox, frame_shape)
+        if detail is None:
             return pose_id, confidence
-        target, floor = hit
-        return target, max(confidence, floor)
+        return detail["pose_id"], max(confidence, detail["confidence"])

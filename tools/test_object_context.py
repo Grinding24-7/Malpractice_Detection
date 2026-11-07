@@ -25,6 +25,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 logging.disable(logging.WARNING)
 
 from desktop_app.core import perf_config  # noqa: E402
+from desktop_app.core.object_context import ObjectContext  # noqa: E402
 from desktop_app.core.pose_classifier import (  # noqa: E402
     MP_LEFT_SHOULDER, MP_LEFT_WRIST, MP_RIGHT_SHOULDER, MP_RIGHT_WRIST,
     OBJ_CLASS_MAP, _PRESENCE_POSES, PoseClassifier,
@@ -546,6 +547,62 @@ def test_object_context_wanted() -> bool:
     return ok
 
 
+def test_document_zone_ownership() -> bool:
+    """Unauthorized documents escalate only when mostly on the candidate desk.
+
+    The venue puts paper on every desk, so the class distinction (answer
+    sheet / exam booklet vs notebook / scratch paper) and the spatial
+    majority gate both matter.  A notebook in a bag or held at the chest is
+    not P13; one lying on the candidate's desk is.
+    """
+    print()
+    print("11. document ownership uses a >50% desk-zone overlap")
+    ok = True
+
+    person_bbox = [560, 120, 720, 700]
+    frame_shape = (FRAME_H, FRAME_W, 3)
+    # desk_zone_for([560,120,720,700]) = [504, 439, 776, 720]
+    c = PoseClassifier.__new__(PoseClassifier)
+    c._object_escalation = None
+
+    def verdict(label: str, box: list[int]) -> str:
+        obj = {"label": label, "confidence": 0.9, "box": box}
+        pose, _ = c._escalate_from_objects(
+            "P01", 0.0, [obj],
+            person_bbox=person_bbox, frame_shape=frame_shape,
+        )
+        return pose
+
+    fully_inside = [520, 450, 600, 530]
+    for label in ("notebook", "loose_scratch_paper", "scratch_paper"):
+        ok &= check(f"unauthorized {label} on desk -> P13",
+                    verdict(label, fully_inside) == "P13")
+    for label in ("answer_sheet", "exam_booklet", "exam_paper"):
+        ok &= check(f"authorized {label} never escalates",
+                    verdict(label, fully_inside) == "P01")
+
+    # Document width 272, zone x2=776: [640..912] has exactly 136 px
+    # inside, i.e. 50.0%.  The requirement is strictly greater than 50%.
+    ok &= check("exactly 50% overlap does not escalate",
+                verdict("notebook", [640, 450, 912, 530]) == "P01")
+    # 102 of 200 px inside = 51%.
+    ok &= check("51% overlap escalates",
+                verdict("notebook", [674, 450, 874, 530]) == "P13")
+    ok &= check("below 50% overlap does not escalate",
+                verdict("notebook", [700, 450, 972, 530]) == "P01")
+    ok &= check("document far from desk does not escalate",
+                verdict("notebook", [100, 100, 300, 220]) == "P01")
+
+    ctx = ObjectContext()
+    ctx.person_bbox = person_bbox
+    ctx.frame_shape = frame_shape
+    ok &= check("document_in_desk_zone agrees at >50%",
+                ctx.document_in_desk_zone(fully_inside))
+    ok &= check("document_in_desk_zone rejects exactly 50%",
+                not ctx.document_in_desk_zone([640, 450, 912, 530]))
+    return ok
+
+
 def main() -> int:
     ok = True
     ok &= test_desk_region_covers_frame()
@@ -558,6 +615,7 @@ def main() -> int:
     ok &= test_class_map()
     ok &= test_custom_model_class_adoption()
     ok &= test_object_context_wanted()
+    ok &= test_document_zone_ownership()
     print()
     print("ALL PASS" if ok else "FAILURES PRESENT")
     return 0 if ok else 1

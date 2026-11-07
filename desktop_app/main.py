@@ -35,6 +35,31 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    # ── Torch runtime fast paths ────────────────────────────────────────
+    # Apply these once, before any model is constructed.  optimize_cuda()
+    # is a no-op on CPU and both switches have environment opt-outs, so a
+    # deployment that sees a regression can disable them without a patch.
+    try:
+        import torch
+
+        from backend.runtime import optimize_cuda, resolve_device
+        from desktop_app.core import perf_config
+        from desktop_app.core.vision_utils import configure_opencv_threads
+
+        cv_threads = configure_opencv_threads()
+        runtime_device = resolve_device(perf_config.INFERENCE_DEVICE)
+        optimize_cuda(runtime_device)
+        logger.info(
+            "Torch runtime: device=%s cudnn_benchmark=%s tf32_matmul=%s "
+            "cv_threads=%s",
+            runtime_device,
+            getattr(torch.backends.cudnn, "benchmark", None),
+            getattr(torch.backends.cuda.matmul, "allow_tf32", None),
+            cv_threads,
+        )
+    except Exception as exc:  # never let a fast-path flag block startup
+        logger.warning("Torch runtime optimization skipped: %s", exc)
+
     logger.info("Starting Exam Malpractice Detection — P01-P40 HUD")
 
     # ── Qt application ───────────────────────────────────────────────────

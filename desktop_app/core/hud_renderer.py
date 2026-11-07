@@ -165,6 +165,8 @@ def render_hud(
     """Draw the full HUD overlay onto *frame* and return the annotated copy."""
     overlay = frame.copy()
     h, w = overlay.shape[:2]
+    # Alert banners sit below the top-right classroom-init header.
+    banner_top = 70
 
     pose_id: str = result.get("pose_id", "P01")
     # NO_SIGNAL and INITIALIZING are system states, not proctoring findings.
@@ -225,6 +227,8 @@ def render_hud(
     gaze_endpoint = result.get("gaze_endpoint")
     landmarks = result.get("landmarks", [])
     first_landmarks = landmarks[0] if landmarks else []
+    track_ids = result.get("track_ids") or []
+    seat_ids = result.get("seat_ids") or []
 
     for person_idx, box in enumerate(boxes):
         x1, y1, x2, y2 = box
@@ -240,14 +244,24 @@ def render_hud(
         )
 
         conf_pct = result.get("confidence", 0) * 100
+        seat = seat_ids[person_idx] if person_idx < len(seat_ids) else None
+        track = track_ids[person_idx] if person_idx < len(track_ids) else None
+        identity = []
+        if seat:
+            identity.append(str(seat))
+        if track is not None:
+            identity.append(f"T#{int(track)}")
+        ident_text = f" {' '.join(identity)}" if identity else ""
         if neutral_active:
             # The neutral filter has vouched for this frame: the verdict is
-            # a benign P00 state, not the raw rule's finding.
-            label = (
-                f"[P00] Candidate #{person_idx + 1:02d}: {neutral_label}"
-            )
+            # a positive benign P00 state, not the raw rule's finding.
+            suffix = f" ({' '.join(identity)})" if identity else ""
+            label = f"[P00] Neutral: {neutral_label}{suffix}"
         else:
-            label = f"[{pose_id}] Candidate {person_idx + 1} (Conf: {conf_pct:.0f}%)"
+            label = (
+                f"[{pose_id}]{ident_text} Candidate {person_idx + 1} "
+                f"(Conf: {conf_pct:.0f}%)"
+            )
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         lbl_x = _safe_int(x1)
         lbl_y = max(th + 8, _safe_int(y1) - 8)
@@ -339,8 +353,14 @@ def render_hud(
             sustain_color, 1, cv2.LINE_AA,
         )
 
+    candidate_count = int(result.get("candidate_count", len(boxes)) or 0)
+    persons_text = f"Persons: {len(boxes)}"
+    if candidate_count != len(boxes):
+        persons_text += f"  Candidates: {candidate_count}"
+    if result.get("presence_held"):
+        persons_text += "  (seat held)"
     cv2.putText(
-        overlay, f"Persons: {len(boxes)}   Model: YOLO11n-pose",
+        overlay, f"{persons_text}   Model: YOLO11n-pose",
         (14, y0 + 145), cv2.FONT_HERSHEY_SIMPLEX, 0.45, _COLOR_TEXT_DIM, 1, cv2.LINE_AA,
     )
 
@@ -361,6 +381,61 @@ def render_hud(
         (14, y0 + 185), cv2.FONT_HERSHEY_SIMPLEX, 0.45, _COLOR_TEXT_DIM, 1, cv2.LINE_AA,
     )
 
+    # ── 3b. Classroom init header (top-right) ─────────────────────────────
+    # The seat inventory is a fact about the room established during startup,
+    # so it gets a permanent header rather than a transient alert.  Alert
+    # banners below are shifted down so the two can never overlap.
+    classroom = result.get("classroom") or {}
+    seated_count = int(result.get("seated_count", 0) or 0)
+    seats_locked = bool(result.get("seats_locked", False))
+    init_in_progress = bool(classroom.get("in_progress"))
+    if seats_locked:
+        init_text = (
+            f"[INIT] Classroom Seated Count: {seated_count} Students Locked"
+        )
+        init_color = _COLOR_TEXT_G
+    elif init_in_progress:
+        seen = int(classroom.get("frames_seen", 0) or 0)
+        target = int(
+            classroom.get("frames_target", perf_config.CLASSROOM_INIT_FRAMES)
+            or perf_config.CLASSROOM_INIT_FRAMES
+        )
+        init_text = f"[INIT] Counting seated heads... {seen}/{target}"
+        init_color = _COLOR_TEXT_CYAN
+    else:
+        init_text = "[INIT] Classroom Seated Count: 0 (anchors not locked)"
+        init_color = _COLOR_TEXT_AMBER
+    (iw, ih), _ = cv2.getTextSize(
+        init_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1
+    )
+    ix = max(8, w - iw - 22)
+    cv2.rectangle(
+        overlay, (ix - 8, 8), (ix + iw + 8, 8 + ih + 14),
+        _COLOR_PANEL_BG, -1,
+    )
+    cv2.rectangle(
+        overlay, (ix - 8, 8), (ix + iw + 8, 8 + ih + 14),
+        _COLOR_PANEL_BD, 1,
+    )
+    cv2.putText(
+        overlay, init_text, (ix, 8 + ih + 6),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.52, init_color, 1, cv2.LINE_AA,
+    )
+
+    # Locked seat anchors: thin cyan head boxes, so the operator can see
+    # which seats the session is tracking.  Drawn behind the banner layer.
+    for anchor in result.get("seat_anchors") or []:
+        abox = anchor.get("box") if isinstance(anchor, dict) else None
+        if not abox or len(abox) != 4:
+            continue
+        ax1, ay1, ax2, ay2 = map(_safe_int, abox)
+        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), _COLOR_JOINTS, 1)
+        cv2.putText(
+            overlay, str(anchor.get("seat_id", "")),
+            (ax1, max(12, ay1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, _COLOR_JOINTS, 1, cv2.LINE_AA,
+        )
+
     # ── 4. Alert banner ───────────────────────────────────────────────────
     if pose_id == "NO_SIGNAL":
         # A camera fault is not a proctoring alert, so it gets its own banner.
@@ -369,18 +444,24 @@ def render_hud(
         banner = "!! CAMERA FAULT: NO IMAGE - ROOM NOT MONITORED !!"
         (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
         bx = max(10, (w - tw) // 2)
-        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), (60, 60, 60), -1)
+        cv2.rectangle(
+            overlay, (bx - 10, banner_top),
+            (bx + tw + 10, banner_top + 45), (60, 60, 60), -1,
+        )
         cv2.putText(
-            overlay, banner, (bx, 42),
+            overlay, banner, (bx, banner_top + 32),
             cv2.FONT_HERSHEY_SIMPLEX, 0.75, _COLOR_TEXT_AMBER, 3, cv2.LINE_AA,
         )
     elif pose_id == "INITIALIZING":
         banner = "STARTING UP - ROOM NOT YET ASSESSED"
         (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
         bx = max(10, (w - tw) // 2)
-        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), (50, 70, 90), -1)
+        cv2.rectangle(
+            overlay, (bx - 10, banner_top),
+            (bx + tw + 10, banner_top + 45), (50, 70, 90), -1,
+        )
         cv2.putText(
-            overlay, banner, (bx, 42),
+            overlay, banner, (bx, banner_top + 32),
             cv2.FONT_HERSHEY_SIMPLEX, 0.75, _COLOR_TEXT_CYAN, 3, cv2.LINE_AA,
         )
     elif is_anomaly and sustain >= perf_config.ALERT_SUSTAIN_FRAMES:
@@ -397,20 +478,26 @@ def render_hud(
         bx = max(10, (w - tw) // 2)
         banner_bg = (0, 0, 180) if is_red else (0, 120, 200)
         banner_fg = _COLOR_TEXT_W
-        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), banner_bg, -1)
+        cv2.rectangle(
+            overlay, (bx - 10, banner_top),
+            (bx + tw + 10, banner_top + 45), banner_bg, -1,
+        )
         cv2.putText(
-            overlay, banner, (bx, 42),
+            overlay, banner, (bx, banner_top + 32),
             cv2.FONT_HERSHEY_SIMPLEX, 0.9, banner_fg, 3, cv2.LINE_AA,
         )
     elif neutral_active:
         # Green P00 banner: the room is being watched and this frame is a
         # benign, vouched-for posture, not an absence of opinion.
-        banner = f"[P00] {neutral_label} (NEUTRAL - NO ALERT)"
+        banner = f"[P00] Neutral - {neutral_label} (NO ALERT)"
         (tw, _), _ = cv2.getTextSize(banner, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 3)
         bx = max(10, (w - tw) // 2)
-        cv2.rectangle(overlay, (bx - 10, 10), (bx + tw + 10, 55), (60, 140, 60), -1)
+        cv2.rectangle(
+            overlay, (bx - 10, banner_top),
+            (bx + tw + 10, banner_top + 45), (60, 140, 60), -1,
+        )
         cv2.putText(
-            overlay, banner, (bx, 42),
+            overlay, banner, (bx, banner_top + 32),
             cv2.FONT_HERSHEY_SIMPLEX, 0.75, _COLOR_TEXT_W, 3, cv2.LINE_AA,
         )
 

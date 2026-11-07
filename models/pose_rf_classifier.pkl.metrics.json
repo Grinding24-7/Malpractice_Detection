@@ -1,0 +1,166 @@
+{
+  "model": "Pipeline(steps=[('imputer',\n                 SimpleImputer(keep_empty_features=True, strategy='median')),\n                ('scaler', StandardScaler()),\n                ('classifier',\n                 RandomForestClassifier(class_weight='balanced', max_depth=30,\n                                        min_samples_leaf=2, min_samples_split=5,\n                                        n_jobs=1, random_state=42))])",
+  "feature_names": [
+    "kpt_x0",
+    "kpt_x1",
+    "kpt_x2",
+    "kpt_x3",
+    "kpt_x4",
+    "kpt_x5",
+    "kpt_x6",
+    "kpt_x7",
+    "kpt_x8",
+    "kpt_x9",
+    "kpt_x10",
+    "kpt_x11",
+    "kpt_x12",
+    "kpt_x13",
+    "kpt_x14",
+    "kpt_x15",
+    "kpt_x16",
+    "kpt_y0",
+    "kpt_y1",
+    "kpt_y2",
+    "kpt_y3",
+    "kpt_y4",
+    "kpt_y5",
+    "kpt_y6",
+    "kpt_y7",
+    "kpt_y8",
+    "kpt_y9",
+    "kpt_y10",
+    "kpt_y11",
+    "kpt_y12",
+    "kpt_y13",
+    "kpt_y14",
+    "kpt_y15",
+    "kpt_y16",
+    "yaw",
+    "pitch",
+    "roll",
+    "elbow_flexion_left",
+    "elbow_flexion_right",
+    "neck_tilt_angle",
+    "wrist_to_eye_ratio",
+    "wrist_to_ear_ratio",
+    "eye_to_shoulder_ratio",
+    "hand_mouth_distance",
+    "shoulder_hip_offset_ratio",
+    "torso_leg_ratio",
+    "shoulder_width_ratio",
+    "hip_width_ratio",
+    "torso_asymmetry",
+    "frame_center_offset_x",
+    "frame_center_offset_y",
+    "bbox_coverage_ratio",
+    "bbox_aspect_ratio",
+    "motion_delta"
+  ],
+  "label_column": "pose_id",
+  "classes": [
+    "P01",
+    "P20"
+  ],
+  "class_counts": {
+    "P01": 523,
+    "P20": 619
+  },
+  "rows": 1142,
+  "dataset": "C:\\Users\\Pratik\\Malpractice_Detection\\data\\proctoring_features.csv",
+  "trained_at": "2026-11-04T03:38:10.846308+00:00",
+  "seed": 42,
+  "test_size": 0.2,
+  "backend": "random_forest",
+  "train_rows": 913,
+  "test_rows": 229,
+  "test_accuracy": 0.9475982532751092,
+  "test_balanced_accuracy": 0.9501536098310291,
+  "test_macro_f1": 0.9474770642201835,
+  "test_weighted_f1": 0.9476863907696005,
+  "classification_report": "              precision    recall  f1-score   support\n\n         P01       0.91      0.98      0.94       105\n         P20       0.98      0.92      0.95       124\n\n    accuracy                           0.95       229\n   macro avg       0.95      0.95      0.95       229\nweighted avg       0.95      0.95      0.95       229\n",
+  "confusion_matrix": [
+    [
+      103,
+      2
+    ],
+    [
+      10,
+      114
+    ]
+  ],
+  "labels": [
+    "P01",
+    "P20"
+  ],
+  "cv": {
+    "folds": 5,
+    "accuracy_mean": 0.9553244464873976,
+    "accuracy_std": 0.011622209200738134,
+    "balanced_accuracy_mean": 0.9556872959193965,
+    "balanced_accuracy_std": 0.01100801587076447,
+    "macro_f1_mean": 0.9550632133465662,
+    "macro_f1_std": 0.011645054060540911
+  },
+  "top_features": [
+    {
+      "feature": "kpt_y1",
+      "importance": 0.06169773663916926
+    },
+    {
+      "feature": "bbox_coverage_ratio",
+      "importance": 0.057676568721245186
+    },
+    {
+      "feature": "frame_center_offset_y",
+      "importance": 0.05488183940240824
+    },
+    {
+      "feature": "kpt_y6",
+      "importance": 0.05337272423920045
+    },
+    {
+      "feature": "kpt_x1",
+      "importance": 0.04950017069154984
+    },
+    {
+      "feature": "bbox_aspect_ratio",
+      "importance": 0.049201626932789795
+    },
+    {
+      "feature": "eye_to_shoulder_ratio",
+      "importance": 0.04057984898822666
+    },
+    {
+      "feature": "shoulder_width_ratio",
+      "importance": 0.03793989666602315
+    },
+    {
+      "feature": "kpt_x0",
+      "importance": 0.03728351090403214
+    },
+    {
+      "feature": "kpt_y2",
+      "importance": 0.03629212221754606
+    },
+    {
+      "feature": "kpt_y5",
+      "importance": 0.03538711780423321
+    },
+    {
+      "feature": "kpt_y0",
+      "importance": 0.03464061771825361
+    },
+    {
+      "feature": "kpt_x2",
+      "importance": 0.03353121339102147
+    },
+    {
+      "feature": "kpt_x6",
+      "importance": 0.03231303169188579
+    },
+    {
+      "feature": "kpt_x5",
+      "importance": 0.027615006390131574
+    }
+  ]
+}

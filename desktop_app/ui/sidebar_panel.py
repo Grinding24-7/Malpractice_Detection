@@ -48,8 +48,13 @@ class SidebarPanel(QWidget):
             "Pose mode", size=12, color="#adb5bd"
         )
         self.occupancy_detail_label.setWordWrap(True)
+        self.classroom_label = self._value(
+            "Seats: --", size=12, color="#adb5bd"
+        )
+        self.classroom_label.setWordWrap(True)
         layout.addWidget(self.occupancy_label)
         layout.addWidget(self.occupancy_detail_label)
+        layout.addWidget(self.classroom_label)
 
         layout.addSpacing(8)
 
@@ -58,9 +63,13 @@ class SidebarPanel(QWidget):
         self.pose_id_label = self._value("--", size=20, bold=True)
         self.pose_name_label = self._value("--", size=13)
         self.confidence_label = self._value("--", size=12, color="#adb5bd")
+        self.identity_label = self._value(
+            "Seat: --  |  Track: --", size=12, color="#adb5bd"
+        )
         layout.addWidget(self.pose_id_label)
         layout.addWidget(self.pose_name_label)
         layout.addWidget(self.confidence_label)
+        layout.addWidget(self.identity_label)
 
         layout.addSpacing(8)
 
@@ -168,6 +177,7 @@ class SidebarPanel(QWidget):
             if error or dead else
             "color: #adb5bd; font-size: 12px;"
         )
+        self._update_classroom(result)
 
         self.pose_id_label.setText("Pose: --")
         self.pose_id_label.setStyleSheet(
@@ -179,6 +189,7 @@ class SidebarPanel(QWidget):
             f"Mean head conf: {float(result.get('confidence', 0.0)):.0%}"
             if count else "No heads detected"
         )
+        self.identity_label.setText("Seat: --  |  Track: --")
         for label in (self.yaw_label, self.pitch_label, self.roll_label):
             label.setText(label.text().split(":")[0] + ": --")
         self.gaze_label.setText("Gaze: --")
@@ -195,6 +206,7 @@ class SidebarPanel(QWidget):
         self.occupancy_detail_label.setStyleSheet(
             "color: #adb5bd; font-size: 12px;"
         )
+        self._update_classroom(result)
         pose_id = result.get("pose_id", "P01")
         # System states (camera fault / startup) and neutral posture states
         # are not anomalies; neutral states get their own green treatment so
@@ -209,17 +221,28 @@ class SidebarPanel(QWidget):
             color = "#ff6b6b"
         else:
             color = "#51cf66"
-        self.pose_id_label.setText(f"Pose: {pose_id}")
+        if is_neutral:
+            # A positive [P00] state, not a quiet P01: the filter has vouched
+            # that this is ordinary exam behaviour.
+            self.pose_id_label.setText("Pose: P00 (Neutral)")
+        else:
+            self.pose_id_label.setText(f"Pose: {pose_id}")
         self.pose_id_label.setStyleSheet(
             f"color: {color}; font-size: 20px; font-weight: bold; font-family: monospace;"
         )
         if is_neutral:
-            # The neutral filter vouched for this frame: name the benign
-            # state instead of the generic "Normal Sitting".
-            self.pose_name_label.setText(f"{neutral_label} (Neutral)")
+            self.pose_name_label.setText(f"Neutral - {neutral_label}")
         else:
             self.pose_name_label.setText(result.get("pose_name", "--"))
         self.confidence_label.setText(f"Confidence: {result.get('confidence', 0):.0%}")
+
+        # Primary candidate's classroom identity, when the session locked
+        # seats at startup or ByteTrack assigned an id.
+        seat_ids = result.get("seat_ids") or []
+        track_ids = result.get("track_ids") or []
+        seat = seat_ids[0] if seat_ids and seat_ids[0] else "--"
+        track = track_ids[0] if track_ids and track_ids[0] is not None else "--"
+        self.identity_label.setText(f"Seat: {seat}  |  Track: {track}")
 
         # 3D Head Pose
         hp = result.get("head_pose", {})
@@ -277,6 +300,28 @@ class SidebarPanel(QWidget):
         self.ticker.append(entry)
         sb = self.ticker.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _update_classroom(self, result: dict) -> None:
+        """Show the SCUT-HEAD seat inventory established at startup."""
+        classroom = result.get("classroom") or {}
+        count = int(result.get("seated_count", 0) or 0)
+        locked = bool(result.get("seats_locked", False))
+        if locked:
+            text = f"Seats: {count} locked (SCUT-HEAD)"
+            color = "#51cf66"
+        elif classroom.get("in_progress"):
+            seen = int(classroom.get("frames_seen", 0) or 0)
+            target = int(classroom.get("frames_target", 0) or 0)
+            text = f"Seats: counting heads... {seen}/{target}"
+            color = "#4dabf7"
+        else:
+            text = "Seats: not locked"
+            color = "#adb5bd"
+        self.classroom_label.setText(text)
+        self.classroom_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: normal; "
+            "font-family: Consolas, monospace;"
+        )
 
     # ------------------------------------------------------------------
     # Helpers

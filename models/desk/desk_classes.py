@@ -28,14 +28,33 @@ DESK_CLASSES: list[str] = [
     "headphones",
     "sheet_of_paper_stack",  # a stack of loose paper / printed pack
     "earbuds",               # appended (id 13); wired to P26 Earbuds
+    # Appended after the original 14-class contract.  Appending keeps old
+    # weights and labels valid; reordering would silently reinterpret every
+    # existing class id.
+    "exam_booklet",          # venue-issued answer booklet (authorized)
+    "loose_scratch_paper",   # loose notes/scratch paper (unauthorized on desk)
 ]
+
+# Documents the venue issues to every candidate.  These are expected on the
+# desk and must never escalate on their own.
+AUTHORIZED_DOCUMENT_CLASSES: frozenset[str] = frozenset({
+    "exam_paper", "answer_sheet", "exam_booklet",
+})
+
+# Documents that are only evidence when they intersect the candidate's
+# designated desk space: a notebook in a bag on the floor is not note-peeking,
+# one open on the desk is.
+UNAUTHORIZED_DOCUMENT_CLASSES: frozenset[str] = frozenset({
+    "notebook", "loose_scratch_paper", "sheet_of_paper_stack",
+})
 
 # Objects that are individually innocent but become evidence only in
 # combination with a spatial relation.  Kept as a named group because the
 # escalation logic should treat these differently from a phone, which is
 # cheating on its own.
 AMBIENT_CLASSES: frozenset[str] = frozenset({
-    "exam_paper", "answer_sheet", "notebook", "sheet_of_paper_stack",
+    "exam_paper", "answer_sheet", "exam_booklet", "notebook",
+    "loose_scratch_paper", "sheet_of_paper_stack",
 })
 
 # Classes that indicate a device or a prohibited aid regardless of context.

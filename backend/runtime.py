@@ -104,10 +104,24 @@ def grad_scaler(device: torch.device, enabled: bool | None = None):
 
 
 def optimize_cuda(device: torch.device) -> None:
-    """Enable the safe global CUDA fast paths once per process."""
+    """Enable the safe global CUDA fast paths once per process.
+
+    Both switches are opt-out so a deployment that observes a regression can
+    disable them without a code change:
+        IP_CUDNN_BENCHMARK=0
+        IP_TF32=0
+    """
     if not is_cuda(device):
         return
-    torch.backends.cudnn.benchmark = True
+
+    if os.environ.get("IP_CUDNN_BENCHMARK", "1").lower() not in {
+        "0", "false", "no", "off",
+    }:
+        torch.backends.cudnn.benchmark = True
+
+    if os.environ.get("IP_TF32", "1").lower() in {"0", "false", "no", "off"}:
+        return
+
     try:
         torch.set_float32_matmul_precision("high")
     except (AttributeError, RuntimeError):
