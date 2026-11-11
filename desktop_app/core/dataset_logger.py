@@ -24,6 +24,8 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import os
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +40,30 @@ from desktop_app.core.feature_schema import (
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_CSV_PATH = _PROJECT_ROOT / "data" / "proctoring_features.csv"
+
+
+def _default_csv_path() -> Path:
+    """Return the recording CSV path.
+
+    Source checkouts record into ``data/`` so the training workflow stays
+    unchanged.  A frozen bundle writes into the user's application-data
+    directory instead: ``_internal`` may be read-only (and is recreated by an
+    upgrade), and a training CSV should never be mixed with installation
+    files.
+    """
+    if not getattr(sys, "frozen", False):
+        return _PROJECT_ROOT / "data" / "proctoring_features.csv"
+
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "IntelliProctor" / "data" / "proctoring_features.csv"
+
+
+_DEFAULT_CSV_PATH = _default_csv_path()
 
 # Kept as a module-level alias for callers/tests that imported the old name.
 _CSV_COLUMNS: list[str] = list(CSV_COLUMNS)

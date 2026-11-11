@@ -186,6 +186,49 @@ set VIDEO_SOURCE=C:\path\to\exam.mp4
 python backend/app.py
 ```
 
+## Packaging the desktop app
+
+Install the runtime and build dependencies, then run the release script:
+
+```bash
+python -m pip install -r requirements.txt -r requirements-build.txt
+python tools/build_release.py --clean
+```
+
+This produces `dist/IntelliProctor/IntelliProctor.exe` and an
+`IntelliProctor.lnk` shortcut inside the deployment bundle. To also place a
+shortcut on the current user's Desktop:
+
+```bash
+python tools/build_release.py --clean --desktop
+```
+
+Desktop creation is opt-in; a normal build never modifies the user's Desktop.
+Use `--force` to replace an existing Desktop shortcut. The shortcut points at
+the packaged `.exe`, starts it in the bundle directory, and uses the
+application icon embedded in the executable, so it remains valid if the
+deployment folder is moved. Pass `--icon path/to/icon.ico` only when a
+separate shortcut icon is required.
+
+The build needs the locally trained (git-ignored) artefacts:
+
+- `assets/pose_landmarker_*.task` (at least the configured MediaPipe variant)
+- `models/pose_rf_classifier.pkl` and its `.metrics.json` sidecar
+- `models/head/scut_head_yolo11n.pt`
+- `backend/yolo11n-pose.pt` and the COCO fallback `backend/yolo11n.pt`
+
+The shortcut helper can also be used on its own:
+
+```bash
+python tools/create_shortcut.py                      # bundle shortcut
+python tools/create_shortcut.py --dest desktop       # current Desktop
+python tools/create_shortcut.py --dest path --dest-dir release/
+```
+
+On Windows the helper writes a real `.lnk` through `WScript.Shell` using only
+the Python standard library and PowerShell. Linux and macOS fall back to a
+`.desktop` file and a `.command` launcher.
+
 ## Project layout
 
 ```

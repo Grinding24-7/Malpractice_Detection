@@ -20,6 +20,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from desktop_app.core.console_redirect import StreamRedirect
@@ -64,8 +65,14 @@ def main() -> int:
 
     # ── Qt application ───────────────────────────────────────────────────
     app = QApplication(sys.argv)
-    app.setApplicationName("Malpractice Detection")
+    app.setApplicationName("IntelliProctor")
     app.setStyle("Fusion")
+
+    # Use the same branded icon that the PyInstaller executable embeds, so
+    # the title bar, taskbar and shortcut all agree.
+    icon_path = _PROJECT_ROOT / "assets" / "IntelliProctor.ico"
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     # ── Console redirect (stdout/stderr/logging → GUI) ───────────────────
     redirect = StreamRedirect()

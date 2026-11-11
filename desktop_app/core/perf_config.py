@@ -25,6 +25,15 @@ reclaimed from work that is redundant rather than inaccurate:
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+
+# Resource root for relative model paths.  When frozen by PyInstaller this
+# resolves to the bundle's ``_internal`` directory, which is where the spec
+# places ``backend`` and ``models``.  Keeping absolute candidates here means
+# object detection still works when the shortcut starts the app from the
+# bundle root instead of ``_internal``.
+_APP_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _csv_set(name: str, default: str) -> frozenset[str]:
@@ -97,6 +106,8 @@ OBJ_FALLBACK_MODEL_FILE: str = os.environ.get("IP_OBJ_MODEL_FALLBACK", "yolo11n.
 # looked up in all of them before falling back to the stock COCO weights.
 OBJ_MODEL_DIRS: tuple[str, ...] = (
     os.environ.get("IP_OBJ_MODEL_DIR", "backend"),
+    str(_APP_ROOT / "models" / "desk"),
+    str(_APP_ROOT / "backend"),
     "models/desk",
     "backend",
 )
