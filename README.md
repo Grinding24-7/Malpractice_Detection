@@ -4,6 +4,16 @@ Intelligent **offline exam malpractice detection system** — analyzes a proctor
 
 Everything runs locally. No cloud, no uploads.
 
+## Prebuilt Windows build
+
+A portable Windows x64 build is published at
+<https://github.com/Grinding24-7/Malpractice_Detection/releases/tag/v1.0.0>.
+
+Download both `.partNNN` files and `Combine-IntelliProctor-parts.cmd`, run the
+combine helper, extract the resulting ZIP, then run
+`Install IntelliProctor.cmd` or `IntelliProctor.exe`. Python is not required.
+See the release notes for checksums, requirements, and troubleshooting.
+
 ## Architecture
 
 Three surfaces share the same detection logic:
