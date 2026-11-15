@@ -220,7 +220,7 @@ The bundle root receives `Install IntelliProctor.cmd` (creates a fresh Desktop
 shortcut at the extracted location) and `README.txt`. The archive is written to
 `dist/release/IntelliProctor-1.0.0-windows-x64.zip`. If it exceeds
 `--split-size-mb` (default 1900 MiB, below GitHub's 2 GiB per-asset limit), it
-is split into `.partNNN` files with `Combine IntelliProctor parts.cmd` and a
+is split into `.partNNN` files with `Combine-IntelliProctor-parts.cmd` and a
 `SHA256SUMS.txt`. The machine-specific `IntelliProctor.lnk` from the build
 machine is excluded from the archive; the portable installer creates the
 correct shortcut on the user's machine.

@@ -237,7 +237,7 @@ def _split_archive(archive: Path, part_size: int, release_dir: Path) -> list[Pat
             index += 1
 
     archive.unlink()
-    combine = release_dir / "Combine IntelliProctor parts.cmd"
+    combine = release_dir / "Combine-IntelliProctor-parts.cmd"
     copy_args = " + ".join(f'"{part.name}"' for part in parts)
     combine.write_text(
         "\r\n".join(
